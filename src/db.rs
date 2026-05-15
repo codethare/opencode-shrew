@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::models::*;
@@ -51,8 +53,8 @@ pub fn list_sessions(
 
     if let Some(term) = search {
         param_idx += 1;
-        conditions.push(format!("(s.title LIKE ?{param_idx} OR s.id LIKE ?{param_idx})"));
-        params.push(Box::new(format!("%{}%", term)));
+        conditions.push(format!("(s.title LIKE ?{param_idx} ESCAPE '\\' OR s.id LIKE ?{param_idx} ESCAPE '\\')"));
+        params.push(Box::new(format!("%{}%", term.replace('%', "\\%").replace('_', "\\_"))));
     }
     if let Some(ts) = since {
         param_idx += 1;
@@ -66,8 +68,8 @@ pub fn list_sessions(
     }
     if let Some(dir) = project {
         param_idx += 1;
-        conditions.push(format!("s.directory LIKE ?{param_idx}"));
-        params.push(Box::new(format!("%{}%", dir)));
+        conditions.push(format!("s.directory LIKE ?{param_idx} ESCAPE '\\'"));
+        params.push(Box::new(format!("%{}%", dir.replace('%', "\\%").replace('_', "\\_"))));
     }
 
     if !conditions.is_empty() {
@@ -102,6 +104,64 @@ pub fn list_sessions(
         })
     })?;
 
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(row?);
+    }
+    Ok(sessions)
+}
+
+pub fn get_data_version(conn: &Connection) -> Result<i64> {
+    let val: i64 = conn.pragma_query_value(None, "data_version", |row| row.get(0))?;
+    Ok(val)
+}
+
+pub fn get_message_count(conn: &Connection, session_id: &str) -> Result<i64> {
+    let sql = "SELECT COUNT(*) FROM message WHERE session_id = ?1";
+    let mut stmt = conn.prepare(sql)?;
+    let count: i64 = stmt.query_row([session_id], |row| row.get(0))?;
+    Ok(count)
+}
+
+pub fn list_sessions_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Session>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: Vec<String> = ids.iter().enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect();
+    let sql = format!(
+        "SELECT s.id, s.project_id, s.slug, s.directory, s.title, \
+                s.time_created, s.time_updated, \
+                s.summary_additions, s.summary_deletions, s.summary_files, \
+                (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msg_count, \
+                (SELECT json_extract(m.data, '$.model.modelID') FROM message m \
+                 WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model \
+         FROM session s WHERE s.id IN ({}) \
+         ORDER BY s.time_created DESC",
+        placeholders.join(",")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = ids
+        .iter()
+        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok(Session {
+            id: row.get("id")?,
+            project_id: row.get("project_id")?,
+            slug: row.get("slug")?,
+            directory: row.get("directory")?,
+            title: row.get("title")?,
+            time_created: row.get("time_created")?,
+            time_updated: row.get("time_updated")?,
+            summary_additions: row.get("summary_additions")?,
+            summary_deletions: row.get("summary_deletions")?,
+            summary_files: row.get("summary_files")?,
+            msg_count: row.get("msg_count")?,
+            model: row.get("model")?,
+        })
+    })?;
     let mut sessions = Vec::new();
     for row in rows {
         sessions.push(row?);
@@ -235,11 +295,11 @@ pub fn search_sessions(conn: &Connection, query: &str, limit: i64) -> Result<Vec
         FROM part p \
         JOIN message m ON m.id = p.message_id \
         JOIN session s ON s.id = m.session_id \
-        WHERE p.data LIKE ?1 AND json_extract(p.data, '$.type') IN ('text', 'reasoning') \
+        WHERE p.data LIKE ?1 ESCAPE '\\' AND json_extract(p.data, '$.type') IN ('text', 'reasoning') \
         ORDER BY m.time_created DESC \
         LIMIT ?2";
 
-    let pattern = format!("%{}%", query.replace('%', "\\%"));
+    let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(rusqlite::params![pattern, limit], |row| {
         let part_data_str: String = row.get("part_data")?;
@@ -274,43 +334,91 @@ pub fn search_sessions(conn: &Connection, query: &str, limit: i64) -> Result<Vec
     Ok(results)
 }
 
-/// Get token usage stats per session
-pub fn session_token_stats(conn: &Connection, session_id: &str) -> Result<Vec<TokenStat>> {
-    let sql = "\
-        SELECT m.id, m.data, m.time_created \
-        FROM message m \
-        WHERE m.session_id = ?1 AND m.data LIKE '%tokens%' \
-        ORDER BY m.time_created ASC";
-
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([session_id], |row| {
-        let data_str: String = row.get("data")?;
-        let data: MessageData = serde_json::from_str(&data_str).unwrap_or_else(|_| MessageData {
-            role: "unknown".to_string(),
-            agent: None,
-            model: None,
-            tokens: None,
-            cost: None,
-            mode: None,
-            parent_id: None,
-        });
-        Ok(TokenStat {
-            message_id: row.get("id")?,
-            role: data.role,
-            agent: data.agent,
-            tokens: data.tokens,
-            cost: data.cost,
-            time_created: row.get("time_created")?,
-        })
-    })?;
-    let mut stats = Vec::new();
-    for row in rows {
-        stats.push(row?);
-    }
-    Ok(stats)
+/// Get sessions grouped by project directory
+pub fn get_report_summary(conn: &Connection, since_ts: i64, until_ts: i64) -> Result<ReportSummary> {
+    let mut stmt = conn.prepare(
+        "SELECT \
+         COUNT(DISTINCT s.id), \
+         COUNT(m.id), \
+         COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER)), 0), \
+         COALESCE(SUM(CAST(json_extract(m.data, '$.cost') AS REAL)), 0.0) \
+         FROM session s \
+         LEFT JOIN message m ON m.session_id = s.id \
+         WHERE s.time_created >= ?1 AND s.time_created <= ?2"
+    )?;
+    let (total_sessions, total_messages, total_tokens, total_cost) =
+        stmt.query_row([since_ts, until_ts], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, f64>(3)?,
+            ))
+        })?;
+    Ok(ReportSummary {
+        total_sessions,
+        total_messages,
+        total_tokens,
+        total_cost,
+        period_start: String::new(),
+        period_end: String::new(),
+    })
 }
 
-/// Get sessions grouped by project directory
+pub fn get_daily_trends(conn: &Connection, since_ts: i64, until_ts: i64) -> Result<Vec<DailyTrend>> {
+    let sql = "SELECT \
+        DATE(s.time_created / 1000, 'unixepoch') AS date, \
+        COUNT(DISTINCT s.id) AS sessions, \
+        COUNT(m.id) AS messages, \
+        COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER)), 0) AS tokens, \
+        COALESCE(SUM(CAST(json_extract(m.data, '$.cost') AS REAL)), 0.0) AS cost \
+     FROM session s \
+     LEFT JOIN message m ON m.session_id = s.id \
+     WHERE s.time_created >= ?1 AND s.time_created <= ?2 \
+     GROUP BY date ORDER BY date";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([since_ts, until_ts], |row| {
+        Ok(DailyTrend {
+            date: row.get("date")?,
+            sessions: row.get("sessions")?,
+            messages: row.get("messages")?,
+            tokens: row.get("tokens")?,
+            cost: row.get("cost")?,
+        })
+    })?;
+    let mut trends = Vec::new();
+    for row in rows {
+        trends.push(row?);
+    }
+    Ok(trends)
+}
+
+pub fn get_model_breakdown(conn: &Connection, since_ts: i64, until_ts: i64) -> Result<Vec<ModelBreakdown>> {
+    let sql = "SELECT \
+        COALESCE(json_extract(m.data, '$.model.modelID'), 'unknown') AS model, \
+        COUNT(*) AS message_count, \
+        COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER)), 0) AS total_tokens, \
+        COALESCE(SUM(CAST(json_extract(m.data, '$.cost') AS REAL)), 0.0) AS total_cost \
+     FROM message m \
+     JOIN session s ON s.id = m.session_id \
+     WHERE s.time_created >= ?1 AND s.time_created <= ?2 \
+     GROUP BY model ORDER BY total_cost DESC";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([since_ts, until_ts], |row| {
+        Ok(ModelBreakdown {
+            model: row.get("model")?,
+            message_count: row.get("message_count")?,
+            total_tokens: row.get("total_tokens")?,
+            total_cost: row.get("total_cost")?,
+        })
+    })?;
+    let mut breakdown = Vec::new();
+    for row in rows {
+        breakdown.push(row?);
+    }
+    Ok(breakdown)
+}
+
 pub fn list_projects(conn: &Connection, limit: i64) -> Result<Vec<ProjectGroup>> {
     let sql = "\
         SELECT s.directory, \
@@ -341,10 +449,7 @@ pub fn list_projects(conn: &Connection, limit: i64) -> Result<Vec<ProjectGroup>>
 /// Rename a session
 pub fn rename_session(conn: &Connection, id: &str, new_title: &str) -> Result<bool> {
     let sql = "UPDATE session SET title = ?1, time_updated = ?2 WHERE id = ?3";
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let now_ms = now_unix_ms();
     let affected = conn.execute(sql, rusqlite::params![new_title, now_ms, id])?;
     Ok(affected > 0)
 }
@@ -377,11 +482,7 @@ pub fn read_session_diff(session_id: &str) -> Result<Vec<DiffEntry>> {
 
 /// List sessions older than a given number of days
 pub fn list_old_sessions(conn: &Connection, days: i64, limit: i64) -> Result<Vec<Session>> {
-    let cutoff_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-        - days * 24 * 60 * 60 * 1000;
+    let cutoff_ms = now_unix_ms() - days * 24 * 60 * 60 * 1000;
 
     let sql = "\
         SELECT s.id, s.project_id, s.slug, s.directory, s.title, \
@@ -517,29 +618,47 @@ pub fn get_session_stats(conn: &Connection, session_id: &str) -> Result<SessionS
 
 /// Top sessions by cost, tokens, or message count
 pub fn top_sessions(conn: &Connection, limit: i64, sort_by: &str) -> Result<Vec<TopSessionEntry>> {
-    let order_field = match sort_by {
-        "cost" => "total_cost",
-        "tokens" => "total_tokens",
-        "msgs" => "msg_count",
-        _ => "total_cost",
+    let sql = match sort_by {
+        "cost" => "\
+            SELECT s.id, s.title, s.directory, s.time_created, \
+                   COUNT(m.id) AS msg_count, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.cost') AS REAL)), 0) AS total_cost, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER)), 0) AS total_tokens, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.input') AS INTEGER)), 0) AS total_input, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.output') AS INTEGER)), 0) AS total_output \
+            FROM session s \
+            JOIN message m ON m.session_id = s.id \
+            GROUP BY s.id \
+            ORDER BY total_cost DESC \
+            LIMIT ?1",
+        "tokens" => "\
+            SELECT s.id, s.title, s.directory, s.time_created, \
+                   COUNT(m.id) AS msg_count, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.cost') AS REAL)), 0) AS total_cost, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER)), 0) AS total_tokens, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.input') AS INTEGER)), 0) AS total_input, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.output') AS INTEGER)), 0) AS total_output \
+            FROM session s \
+            JOIN message m ON m.session_id = s.id \
+            GROUP BY s.id \
+            ORDER BY total_tokens DESC \
+            LIMIT ?1",
+        "msgs" => "\
+            SELECT s.id, s.title, s.directory, s.time_created, \
+                   COUNT(m.id) AS msg_count, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.cost') AS REAL)), 0) AS total_cost, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER)), 0) AS total_tokens, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.input') AS INTEGER)), 0) AS total_input, \
+                   COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.output') AS INTEGER)), 0) AS total_output \
+            FROM session s \
+            JOIN message m ON m.session_id = s.id \
+            GROUP BY s.id \
+            ORDER BY msg_count DESC \
+            LIMIT ?1",
+        _ => bail!("Invalid sort field: {sort_by}. Use 'cost', 'tokens', or 'msgs'."),
     };
 
-    let sql = format!(
-        "\
-        SELECT s.id, s.title, s.directory, s.time_created, \
-               COUNT(m.id) AS msg_count, \
-               COALESCE(SUM(CAST(json_extract(m.data, '$.cost') AS REAL)), 0) AS total_cost, \
-               COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER)), 0) AS total_tokens, \
-               COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.input') AS INTEGER)), 0) AS total_input, \
-               COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.output') AS INTEGER)), 0) AS total_output \
-        FROM session s \
-        JOIN message m ON m.session_id = s.id \
-        GROUP BY s.id \
-        ORDER BY {order_field} DESC \
-        LIMIT ?1"
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([limit], |row| {
         Ok(TopSessionEntry {
             id: row.get("id")?,
@@ -560,12 +679,55 @@ pub fn top_sessions(conn: &Connection, limit: i64, sort_by: &str) -> Result<Vec<
     Ok(entries)
 }
 
+pub fn top_sessions_in_range(conn: &Connection, limit: i64, since_ts: i64, until_ts: i64) -> Result<Vec<TopSessionEntry>> {
+    let sql = "\
+        SELECT s.id, s.title, s.directory, s.time_created, \
+               COUNT(m.id) AS msg_count, \
+               COALESCE(SUM(CAST(json_extract(m.data, '$.cost') AS REAL)), 0) AS total_cost, \
+               COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER)), 0) AS total_tokens, \
+               COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.input') AS INTEGER)), 0) AS total_input, \
+               COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.output') AS INTEGER)), 0) AS total_output \
+        FROM session s \
+        JOIN message m ON m.session_id = s.id \
+        WHERE s.time_created >= ?1 AND s.time_created <= ?2 \
+        GROUP BY s.id \
+        ORDER BY total_cost DESC \
+        LIMIT ?3";
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![since_ts, until_ts, limit], |row| {
+        Ok(TopSessionEntry {
+            id: row.get("id")?,
+            title: row.get("title")?,
+            directory: row.get("directory")?,
+            time_created: row.get("time_created")?,
+            msg_count: row.get("msg_count")?,
+            total_cost: row.get("total_cost")?,
+            total_tokens: row.get("total_tokens")?,
+            total_input: row.get("total_input")?,
+            total_output: row.get("total_output")?,
+        })
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as i64
+}
+
 fn truncate_with_context(text: &str, query: &str, context_chars: usize) -> String {
-    let lower_text = text.to_lowercase();
     let lower_query = query.to_lowercase();
+    let lower_text = text.to_lowercase();
     if let Some(byte_pos) = lower_text.find(&lower_query) {
-        // Count chars up to byte_pos to get char-based position
-        let char_pos = text[..byte_pos].chars().count();
+        // Count chars in lower_text (safe byte_pos) to get char position
+        let char_pos = lower_text[..byte_pos].chars().count();
         let query_chars = query.chars().count();
         let total_chars = text.chars().count();
         let half = context_chars / 2;
