@@ -26,7 +26,7 @@ pub struct Message {
     pub data: MessageData,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Part {
     pub id: String,
     pub message_id: String,
@@ -50,7 +50,7 @@ pub struct MessageData {
     pub parent_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelInfo {
     #[serde(default)]
     pub provider_id: Option<String>,
@@ -80,7 +80,7 @@ pub struct CacheUsage {
     pub read: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PartData {
     pub r#type: String,
     #[serde(default)]
@@ -110,7 +110,7 @@ pub struct ToolState {
     pub output: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TimeRange {
     #[serde(default)]
     pub start: Option<i64>,
@@ -155,7 +155,7 @@ impl MessageWithParts {
 
 // ── Search results ──
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub session_id: String,
     pub session_title: String,
@@ -165,21 +165,9 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
-// ── Token stats ──
-
-#[derive(Debug, Clone)]
-pub struct TokenStat {
-    pub message_id: String,
-    pub role: String,
-    pub agent: Option<String>,
-    pub tokens: Option<TokenUsage>,
-    pub cost: Option<f64>,
-    pub time_created: i64,
-}
-
 // ── Session stats (aggregated) ──
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionStats {
     pub session_id: String,
     pub session_title: String,
@@ -196,7 +184,7 @@ pub struct SessionStats {
     pub agent_breakdown: Vec<AgentBreakdown>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentBreakdown {
     pub agent: String,
     pub message_count: i64,
@@ -206,7 +194,7 @@ pub struct AgentBreakdown {
 
 // ── Top sessions entry ──
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TopSessionEntry {
     pub id: String,
     pub title: String,
@@ -235,7 +223,34 @@ pub struct DiffEntry {
 
 // ── Project groups ──
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportSummary {
+    pub total_sessions: i64,
+    pub total_messages: i64,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+    pub period_start: String,
+    pub period_end: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DailyTrend {
+    pub date: String,
+    pub sessions: i64,
+    pub messages: i64,
+    pub tokens: i64,
+    pub cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelBreakdown {
+    pub model: String,
+    pub message_count: i64,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProjectGroup {
     pub directory: String,
     pub session_count: i64,
