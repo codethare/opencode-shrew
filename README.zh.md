@@ -1,4 +1,4 @@
-# ocv — OpenCode 会话查看器
+# ocs — OpenCode 会话查看器
 
 直接从 SQLite 读取和浏览 [OpenCode](https://github.com/opencode-ai/opencode) 会话数据，绕过 `opencode export`。
 
@@ -19,9 +19,9 @@
 
 ```bash
 git clone <repo>
-cd ocv
+cd ocs
 cargo build --release
-# 二进制文件位于 ./target/release/ocv
+# 二进制文件位于 ./target/release/ocs
 ```
 
 需要系统 SQLite (`libsqlite3`)。Debian/Ubuntu：`apt install libsqlite3-dev`。Arch：`sqlite` 已预装。
@@ -29,7 +29,7 @@ cargo build --release
 ## 使用方法
 
 ```
-ocv <COMMAND>
+ocs <COMMAND>
 
 Commands:
   list      列出会话
@@ -45,7 +45,7 @@ Commands:
   help      打印帮助信息
 ```
 
-### `ocv list`
+### `ocs list`
 
 | 选项 | 说明 |
 |--------|-------------|
@@ -57,41 +57,41 @@ Commands:
 | `--compact` | Tab 分隔的紧凑格式 |
 | `-i`, `--interactive` | 通过 peco/fzf 交互式选择 |
 
-### `ocv show <id>`
+### `ocs show <id>`
 
 | 选项 | 说明 |
 |--------|-------------|
 | `--raw` | 输出原始 JSON |
 | `--no-tool` | 隐藏工具调用详情 |
 
-### `ocv stats <id>`
+### `ocs stats <id>`
 
 显示消息数、Token 用量（输入/输出/推理/缓存）、总费用和按代理细分。
 
-### `ocv top`
+### `ocs top`
 
 | 选项 | 说明 |
 |--------|-------------|
 | `-l`, `--limit N` | 最大显示数（默认 10） |
 | `-b`, `--by FIELD` | 排序字段：`cost`（默认）、`tokens`、`msgs` |
 
-### `ocv search <query>`
+### `ocs search <query>`
 
 | 选项 | 说明 |
 |--------|-------------|
 | `-l`, `--limit N` | 最大匹配数（默认 20） |
 
-### `ocv projects`
+### `ocs projects`
 
 | 选项 | 说明 |
 |--------|-------------|
 | `-l`, `--limit N` | 最大项目数（默认 20） |
 
-### `ocv rename <id> <new-title>`
+### `ocs rename <id> <new-title>`
 
 原地重命名会话（更新标题）。
 
-### `ocv prune`
+### `ocs prune`
 
 | 选项 | 说明 |
 |--------|-------------|
@@ -99,7 +99,7 @@ Commands:
 | `--dry-run` | 预览要删除的内容，不实际删除 |
 | `--force` | 跳过确认提示 |
 
-### `ocv run <message>`
+### `ocs run <message>`
 
 `opencode run` 的 session 感知封装。继承 stdin/stdout 用于交互式使用。
 
@@ -109,9 +109,9 @@ Commands:
 | `-f`, `--fork` | 从指定会话派生 |
 | `-i`, `--interactive` | 通过 peco/fzf 交互式选择会话 |
 
-当指定 `--session` 或 `-i` 时，ocv 从 SQLite 查找会话的工作目录，并自动传递 `--dir <path>` 给 `opencode run`。
+当指定 `--session` 或 `-i` 时，ocs 从 SQLite 查找会话的工作目录，并自动传递 `--dir <path>` 给 `opencode run`。
 
-### `ocv diff <id>`
+### `ocs diff <id>`
 
 显示会话期间记录的文件变更（unified diff 格式）。
 
@@ -119,57 +119,57 @@ Commands:
 
 ```bash
 # 列出最近会话
-ocv list
+ocs list
 
 # 按项目筛选
-ocv list --project omocode
+ocs list --project omocode
 
 # 紧凑格式，管道到 peco
-ocv list --compact -i
+ocs list --compact -i
 
 # 查看会话
-ocv show ses_abc123
+ocs show ses_abc123
 
 # 查看时不显示工具调用细节
-ocv show ses_abc123 --no-tool
+ocs show ses_abc123 --no-tool
 
 # 跨会话全文搜索
-ocv search "error handling"
+ocs search "error handling"
 
 # 查看费用最高的会话
-ocv top --by cost --limit 5
+ocs top --by cost --limit 5
 
 # 查看会话统计
-ocv stats ses_abc123
+ocs stats ses_abc123
 
 # 查看有哪些项目
-ocv projects
+ocs projects
 
 # 重命名会话
-ocv rename ses_abc123 "My new title"
+ocs rename ses_abc123 "My new title"
 
 # 预览 60 天前的旧会话
-ocv prune --older-than 60 --dry-run
+ocs prune --older-than 60 --dry-run
 
 # 删除它们
-ocv prune --older-than 60 --force
+ocs prune --older-than 60 --force
 
 # 查看文件差异
-ocv diff ses_abc123
+ocs diff ses_abc123
 
 # 在已有会话中继续（自动从数据库设置 --dir）
-ocv run -s ses_abc123 "continue implementing this feature"
+ocs run -s ses_abc123 "continue implementing this feature"
 
 # 从会话派生，尝试不同方案
-ocv run -s ses_abc123 --fork "try a different approach"
+ocs run -s ses_abc123 --fork "try a different approach"
 
 # 交互式：通过 peco/fzf 选择会话后执行
-ocv run -i "从选中的会话继续"
+ocs run -i "从选中的会话继续"
 ```
 
 ## 数据来源
 
-ocv 直接读取：
+ocs 直接读取：
 
 ```
 ~/.local/share/opencode/opencode.db

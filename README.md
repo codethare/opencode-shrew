@@ -1,4 +1,4 @@
-# ocv — OpenCode Session Viewer
+# ocs — OpenCode Session Viewer
 
 Read and browse [OpenCode](https://github.com/opencode-ai/opencode) session data directly from SQLite, bypassing `opencode export`.
 
@@ -19,9 +19,9 @@ Read and browse [OpenCode](https://github.com/opencode-ai/opencode) session data
 
 ```bash
 git clone <repo>
-cd ocv
+cd ocs
 cargo build --release
-# binary at ./target/release/ocv
+# binary at ./target/release/ocs
 ```
 
 Requires `libsqlite3` (system SQLite). On Debian/Ubuntu: `apt install libsqlite3-dev`. On Arch: `sqlite` is already present.
@@ -29,7 +29,7 @@ Requires `libsqlite3` (system SQLite). On Debian/Ubuntu: `apt install libsqlite3
 ## Usage
 
 ```
-ocv <COMMAND>
+ocs <COMMAND>
 
 Commands:
   list      List sessions
@@ -45,7 +45,7 @@ Commands:
   help      Print this message or the help of the given subcommand(s)
 ```
 
-### `ocv list`
+### `ocs list`
 
 | Option | Description |
 |--------|-------------|
@@ -57,41 +57,41 @@ Commands:
 | `--compact` | Tab-separated one-liner format |
 | `-i`, `--interactive` | Pipe through peco/fzf for selection |
 
-### `ocv show <id>`
+### `ocs show <id>`
 
 | Option | Description |
 |--------|-------------|
 | `--raw` | Output raw JSON |
 | `--no-tool` | Hide tool call details |
 
-### `ocv stats <id>`
+### `ocs stats <id>`
 
 Shows message counts, token usage (input/output/reasoning/cache), total cost, and per-agent breakdown.
 
-### `ocv top`
+### `ocs top`
 
 | Option | Description |
 |--------|-------------|
 | `-l`, `--limit N` | Max sessions (default 10) |
 | `-b`, `--by FIELD` | Sort field: `cost` (default), `tokens`, `msgs` |
 
-### `ocv search <query>`
+### `ocs search <query>`
 
 | Option | Description |
 |--------|-------------|
 | `-l`, `--limit N` | Max matches (default 20) |
 
-### `ocv projects`
+### `ocs projects`
 
 | Option | Description |
 |--------|-------------|
 | `-l`, `--limit N` | Max projects (default 20) |
 
-### `ocv rename <id> <new-title>`
+### `ocs rename <id> <new-title>`
 
 Renames a session (updates title in-place).
 
-### `ocv prune`
+### `ocs prune`
 
 | Option | Description |
 |--------|-------------|
@@ -99,7 +99,7 @@ Renames a session (updates title in-place).
 | `--dry-run` | Show what would be deleted, don't delete |
 | `--force` | Skip confirmation prompt |
 
-### `ocv run <message>`
+### `ocs run <message>`
 
 Session-aware wrapper around `opencode run`. Inherits stdin/stdout for interactive use.
 
@@ -109,9 +109,9 @@ Session-aware wrapper around `opencode run`. Inherits stdin/stdout for interacti
 | `-f`, `--fork` | Fork from the specified session |
 | `-i`, `--interactive` | Pick session interactively via peco/fzf |
 
-When `--session` or `-i` is provided, ocv looks up the session's working directory from SQLite and passes `--dir <path>` to `opencode run`, so you don't need to `cd` to the right directory first.
+When `--session` or `-i` is provided, ocs looks up the session's working directory from SQLite and passes `--dir <path>` to `opencode run`, so you don't need to `cd` to the right directory first.
 
-### `ocv diff <id>`
+### `ocs diff <id>`
 
 Shows file changes (unified diff) recorded for a session, if available.
 
@@ -119,57 +119,57 @@ Shows file changes (unified diff) recorded for a session, if available.
 
 ```bash
 # List recent sessions
-ocv list
+ocs list
 
 # Filter by project
-ocv list --project omocode
+ocs list --project omocode
 
 # Compact format, pipe to peco
-ocv list --compact -i
+ocs list --compact -i
 
 # View a session
-ocv show ses_abc123
+ocs show ses_abc123
 
 # View without tool details
-ocv show ses_abc123 --no-tool
+ocs show ses_abc123 --no-tool
 
 # Search across all sessions
-ocv search "error handling"
+ocs search "error handling"
 
 # See which sessions cost the most
-ocv top --by cost --limit 5
+ocs top --by cost --limit 5
 
 # Stats for a session
-ocv stats ses_abc123
+ocs stats ses_abc123
 
 # What projects have sessions?
-ocv projects
+ocs projects
 
 # Rename a session
-ocv rename ses_abc123 "My new title"
+ocs rename ses_abc123 "My new title"
 
 # See what old sessions exist
-ocv prune --older-than 60 --dry-run
+ocs prune --older-than 60 --dry-run
 
 # Delete them
-ocv prune --older-than 60 --force
+ocs prune --older-than 60 --force
 
 # View file diffs
-ocv diff ses_abc123
+ocs diff ses_abc123
 
 # Run a new prompt in an existing session (auto-sets --dir from DB)
-ocv run -s ses_abc123 "continue implementing this feature"
+ocs run -s ses_abc123 "continue implementing this feature"
 
 # Fork from a session to try a different approach
-ocv run -s ses_abc123 --fork "try a different approach"
+ocs run -s ses_abc123 --fork "try a different approach"
 
 # Interactive: pick a session via peco/fzf, then run
-ocv run -i "continue from selected session"
+ocs run -i "continue from selected session"
 ```
 
 ## Data Source
 
-ocv reads directly from:
+ocs reads directly from:
 
 ```
 ~/.local/share/opencode/opencode.db
