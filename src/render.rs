@@ -29,7 +29,13 @@ pub fn render_session_list_compact(sessions: &[Session]) -> Vec<String> {
         .map(|s| {
             let created_ts = ts_to_compact(s.time_created);
             let model = s.model.as_deref().unwrap_or("unknown");
-            format!("{}\t{}\t{}\t{}\t{}", s.id, created_ts, s.msg_count, model, s.title)
+            let project = s.directory.rsplit('/').next().unwrap_or(&s.directory);
+            let cost_str = if s.total_cost > 0.0 {
+                format!("${:.2}", s.total_cost)
+            } else {
+                String::new()
+            };
+            format!("{}\t{}\t{}\t{}\t{}\t{}\t{}", s.id, created_ts, s.msg_count, model, cost_str, project, s.title)
         })
         .collect()
 }
@@ -372,6 +378,38 @@ pub fn render_search_results(results: &[SearchResult], query: &str) -> String {
     out
 }
 
+/// Render a session preview for interactive selection (compact info card)
+pub fn render_session_preview(s: &Session) -> String {
+    let created = ts_to_compact(s.time_created);
+    let model = s.model.as_deref().unwrap_or("unknown");
+    let cost = format!("${:.4}", s.total_cost);
+    let project = s.directory.rsplit('/').next().unwrap_or(&s.directory);
+    let diff = match (s.summary_additions, s.summary_deletions) {
+        (Some(a), Some(d)) if a > 0 || d > 0 => format!("(+{}/{})", a, d),
+        _ => String::new(),
+    };
+    format!(
+        "\
+────────────────────────────────────────\n\
+  Title:    {title}\n\
+  Session:  {id}\n\
+  Model:    {model}\n\
+  Project:  {project}\n\
+  Messages: {msgs}\n\
+  Cost:     {cost}\n\
+  Created:  {created} {diff}\n\
+────────────────────────────────────────",
+        title = s.title,
+        id = s.id,
+        model = model,
+        project = project,
+        msgs = s.msg_count,
+        cost = cost,
+        created = created,
+        diff = diff,
+    )
+}
+
 /// Render top sessions table
 pub fn render_top_sessions(entries: &[TopSessionEntry], sort_by: &str) -> String {
     let mut out = String::new();
@@ -402,6 +440,84 @@ pub fn render_top_sessions(entries: &[TopSessionEntry], sort_by: &str) -> String
             ts,
         ));
     }
+    out
+}
+
+/// Render session context summary (metadata + tags + stats + related)
+pub fn render_session_context(session: &Session, stats: &SessionStats, tags: &[String], note: Option<&str>, related: &[Session]) -> String {
+    let mut out = String::new();
+    let created_ts = ts_to_iso_short(session.time_created);
+    let model = session.model.as_deref().unwrap_or("unknown");
+
+    out.push_str(&format!("# Context: {}\n\n", session.title));
+    out.push_str("---\n\n");
+    out.push_str(&format!("**Session**: `{}`  \n", session.id));
+    out.push_str(&format!("**Model**: `{}`  \n", model));
+    out.push_str(&format!("**Directory**: `{}`  \n", session.directory));
+    out.push_str(&format!("**Created**: {}  \n", created_ts));
+    out.push_str(&format!("**Messages**: {}  \n", session.msg_count));
+
+    if session.summary_additions.unwrap_or(0) > 0 || session.summary_deletions.unwrap_or(0) > 0 {
+        out.push_str(&format!("**Files changed**: {} (+{}/-{})  \n",
+            session.summary_files.unwrap_or(0),
+            session.summary_additions.unwrap_or(0),
+            session.summary_deletions.unwrap_or(0)));
+    }
+
+    // Tags
+    if !tags.is_empty() {
+        out.push('\n');
+        out.push_str(&format!("**Tags**: {}  \n", tags.join(", ")));
+    }
+
+    // Annotation
+    if let Some(n) = note {
+        out.push('\n');
+        out.push_str("---\n\n");
+        out.push_str("## Annotation\n\n");
+        out.push_str(n);
+        out.push('\n');
+    }
+
+    // Stats summary
+    out.push('\n');
+    out.push_str("---\n\n");
+    out.push_str("## Token Usage\n\n");
+    out.push_str(&format!("| Metric | Value |\n|---|---|\n"));
+    out.push_str(&format!("| Total Tokens | {} |\n", stats.total_tokens));
+    out.push_str(&format!("| Input / Output | {} / {} |\n", stats.input_tokens, stats.output_tokens));
+    out.push_str(&format!("| Reasoning | {} |\n", stats.reasoning_tokens));
+    out.push_str(&format!("| Total Cost | ${:.6} |\n", stats.total_cost));
+
+    if !stats.agent_breakdown.is_empty() {
+        out.push('\n');
+        out.push_str("## Agents\n\n");
+        out.push_str("| Agent | Messages | Tokens | Cost |\n|---|---|---|---|\n");
+        for a in &stats.agent_breakdown {
+            out.push_str(&format!("| {} | {} | {} | ${:.6} |\n",
+                a.agent, a.message_count, a.total_tokens, a.total_cost));
+        }
+    }
+
+    // Related sessions
+    if !related.is_empty() {
+        out.push('\n');
+        out.push_str("---\n\n");
+        out.push_str(&format!("## Related Sessions (same project)\n\n"));
+        out.push_str("| Session | Title | Messages | Model | Created |\n|---|---|---|---|---|\n");
+        for r in related {
+            let r_ts = ts_to_iso_short(r.time_created);
+            let r_model = r.model.as_deref().unwrap_or("—");
+            let short_id = if r.id.chars().count() > 12 {
+                format!("{}…", r.id.chars().take(12).collect::<String>())
+            } else {
+                r.id.clone()
+            };
+            out.push_str(&format!("| `{}` | {} | {} | {} | {} |\n",
+                short_id, r.title, r.msg_count, r_model, r_ts));
+        }
+    }
+
     out
 }
 
@@ -613,7 +729,7 @@ pub fn render_message_compact(msg: &MessageWithParts) -> String {
         "user" => {
             let body = msg.text_body();
             let preview: String = body.chars().take(80).collect();
-            if body.len() > 80 {
+            if body.chars().count() > 80 {
                 format!("[{ts}] 🧑 User: {}…", preview)
             } else {
                 format!("[{ts}] 🧑 User: {}", preview)
@@ -630,7 +746,7 @@ pub fn render_message_compact(msg: &MessageWithParts) -> String {
                 .unwrap_or_default();
             let body = msg.text_body();
             let preview: String = body.chars().take(80).collect();
-            if body.len() > 80 {
+            if body.chars().count() > 80 {
                 format!("[{ts}] 🤖 {agent}{}{}: {}…", tokens, cost, preview)
             } else {
                 format!("[{ts}] 🤖 {agent}{}{}: {}", tokens, cost, preview)
@@ -642,7 +758,7 @@ pub fn render_message_compact(msg: &MessageWithParts) -> String {
 
 fn ts_to_iso(ts: i64) -> String {
     let secs = ts / 1000;
-    let nsecs = ((ts % 1000) * 1_000_000) as u32;
+    let nsecs = (ts.rem_euclid(1000) * 1_000_000) as u32;
     match DateTime::from_timestamp(secs, nsecs) {
         Some(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
         None => format!("(invalid timestamp {})", ts),
@@ -654,7 +770,6 @@ pub fn render_compare_markdown(
     s2: &Session,
     mp1: &[MessageWithParts],
     mp2: &[MessageWithParts],
-    _stats_only: bool,
 ) -> Result<String, anyhow::Error> {
     let mut out = String::new();
     out.push_str("# 会话对比\n\n");
@@ -752,7 +867,6 @@ pub fn render_compare_json(
     s2: &Session,
     mp1: &[MessageWithParts],
     mp2: &[MessageWithParts],
-    _stats_only: bool,
 ) -> Result<String, anyhow::Error> {
     use serde::Serialize;
 
@@ -810,16 +924,16 @@ pub fn render_compare_json(
 
 fn ts_to_iso_short(ts: i64) -> String {
     let secs = ts / 1000;
-    let nsecs = ((ts % 1000) * 1_000_000) as u32;
+    let nsecs = (ts.rem_euclid(1000) * 1_000_000) as u32;
     match DateTime::from_timestamp(secs, nsecs) {
         Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
         None => format!("(invalid timestamp {})", ts),
     }
 }
 
-fn ts_to_compact(ts: i64) -> String {
+pub(crate) fn ts_to_compact(ts: i64) -> String {
     let secs = ts / 1000;
-    let nsecs = ((ts % 1000) * 1_000_000) as u32;
+    let nsecs = (ts.rem_euclid(1000) * 1_000_000) as u32;
     match DateTime::from_timestamp(secs, nsecs) {
         Some(dt) => dt.format("%m-%d %H:%M").to_string(),
         None => String::new(),
@@ -828,7 +942,7 @@ fn ts_to_compact(ts: i64) -> String {
 
 fn ts_to_time(ts: i64) -> String {
     let secs = ts / 1000;
-    let nsecs = ((ts % 1000) * 1_000_000) as u32;
+    let nsecs = (ts.rem_euclid(1000) * 1_000_000) as u32;
     match DateTime::from_timestamp(secs, nsecs) {
         Some(dt) => dt.format("%H:%M:%S").to_string(),
         None => String::new(),
