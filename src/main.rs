@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use clap_complete::generate;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,6 +60,10 @@ enum Commands {
         /// Only show sessions with annotations
         #[arg(long)]
         annotated: bool,
+
+        /// Only show sessions submitted from the command line (exclude search results, community questions, etc.)
+        #[arg(long)]
+        cli_only: bool,
     },
 
     /// Show a session's messages
@@ -302,8 +307,8 @@ fn main() -> Result<()> {
     let conn = db::open_db(None)?;
 
     match cli.command {
-        Commands::List { limit, search, since, until, project, compact, interactive, json, annotated } => {
-            cmd_list(&conn, limit, search.as_deref(), since.as_deref(), until.as_deref(), project.as_deref(), compact, interactive, json, annotated)
+        Commands::List { limit, search, since, until, project, compact, interactive, json, annotated, cli_only } => {
+            cmd_list(&conn, limit, search.as_deref(), since.as_deref(), until.as_deref(), project.as_deref(), compact, interactive, json, annotated, cli_only)
         }
         Commands::Show { id, raw, no_tool, sanitize } => {
             cmd_show(&conn, &id, raw, !no_tool, sanitize)
@@ -367,6 +372,7 @@ fn cmd_list(
     interactive: bool,
     json: bool,
     annotated: bool,
+    cli_only: bool,
 ) -> Result<()> {
     let since_ts = since.and_then(parse_date);
     let until_ts = until.and_then(parse_date);
@@ -379,7 +385,7 @@ fn cmd_list(
             db::list_sessions_by_ids(conn, &annotated_ids)?
         }
     } else {
-        db::list_sessions(conn, limit, search, since_ts, until_ts, project)?
+        db::list_sessions(conn, limit, search, since_ts, until_ts, project, None, cli_only)?
     };
 
     if sessions.is_empty() {
@@ -483,7 +489,7 @@ fn cmd_show(conn: &rusqlite::Connection, id: &str, raw: bool, show_tools: bool, 
             .map(|msg| {
                 let parts = parts_map
                     .iter()
-                    .find(|(mid, _)| *mid == msg.id)
+                    .find(|(mid, _)| **mid == msg.id)
                     .map(|(_, parts)| parts.clone())
                     .unwrap_or_default();
                 models::MessageWithParts { message: msg, parts }
@@ -502,7 +508,7 @@ fn cmd_show(conn: &rusqlite::Connection, id: &str, raw: bool, show_tools: bool, 
         .map(|msg| {
             let parts = parts_map
                 .iter()
-                .find(|(mid, _)| *mid == msg.id)
+                .find(|(mid, _)| **mid == msg.id)
                 .map(|(_, parts)| parts.clone())
                 .unwrap_or_default();
             models::MessageWithParts { message: msg, parts }
@@ -650,7 +656,7 @@ fn cmd_run(conn: &rusqlite::Connection, message: &str, session: Option<&str>, fo
             s.to_string()
         }
         None if interactive => {
-            let sessions = db::list_sessions(conn, 50, None, None, None, None)?;
+            let sessions = db::list_sessions(conn, 50, None, None, None, None, None, false)?;
             if sessions.is_empty() {
                 bail!("No sessions found.");
             }
@@ -720,7 +726,7 @@ fn cmd_watch(conn: &rusqlite::Connection, id: Option<&str>, poll_secs: u64, show
     let sid = match id {
         Some(s) => s.to_string(),
         None => {
-            let sessions = db::list_sessions(conn, 1, None, None, None, None)?;
+            let sessions = db::list_sessions(conn, 1, None, None, None, None, None, false)?;
             let s = sessions.first()
                 .cloned()
                 .with_context(|| "No sessions found.")?;
@@ -788,7 +794,7 @@ fn cmd_watch(conn: &rusqlite::Connection, id: Option<&str>, poll_secs: u64, show
             .map(|msg| {
                 let parts = parts_map
                     .iter()
-                    .find(|(mid, _)| *mid == msg.id)
+                    .find(|(mid, _)| **mid == msg.id)
                     .map(|(_, parts)| parts.clone())
                     .unwrap_or_default();
                 models::MessageWithParts { message: msg, parts }
@@ -937,7 +943,7 @@ fn cmd_report(conn: &rusqlite::Connection, since: Option<&str>, until: Option<&s
     Ok(())
 }
 
-fn cmd_compare(conn: &rusqlite::Connection, id1: &str, id2: &str, stats_only: bool, json: bool, output: Option<&str>) -> Result<()> {
+fn cmd_compare(conn: &rusqlite::Connection, id1: &str, id2: &str, _stats_only: bool, json: bool, output: Option<&str>) -> Result<()> {
     validate_session_id(id1)?;
     validate_session_id(id2)?;
     let s1 = db::get_session(conn, id1)?
@@ -953,10 +959,10 @@ fn cmd_compare(conn: &rusqlite::Connection, id1: &str, id2: &str, stats_only: bo
     let p1 = db::get_parts_batch(conn, &ids1)?;
     let p2 = db::get_parts_batch(conn, &ids2)?;
 
-    let attach_parts = |messages: Vec<models::Message>, parts_map: &[(String, Vec<models::Part>)]| -> Vec<models::MessageWithParts> {
+    let attach_parts = |messages: Vec<models::Message>, parts_map: &std::collections::HashMap<String, Vec<models::Part>>| -> Vec<models::MessageWithParts> {
         messages.into_iter().map(|msg| {
             let parts = parts_map.iter()
-                .find(|(mid, _)| *mid == msg.id)
+                .find(|(mid, _)| **mid == msg.id)
                 .map(|(_, p)| p.clone())
                 .unwrap_or_default();
             models::MessageWithParts { message: msg, parts }
@@ -967,9 +973,9 @@ fn cmd_compare(conn: &rusqlite::Connection, id1: &str, id2: &str, stats_only: bo
     let mp2 = attach_parts(m2, &p2);
 
     let content = if json {
-        render::render_compare_json(&s1, &s2, &mp1, &mp2, stats_only)?
+        render::render_compare_json(&s1, &s2, &mp1, &mp2)?
     } else {
-        render::render_compare_markdown(&s1, &s2, &mp1, &mp2, stats_only)?
+        render::render_compare_markdown(&s1, &s2, &mp1, &mp2)?
     };
 
     match output {
@@ -991,7 +997,7 @@ fn cmd_export(conn: &rusqlite::Connection, id: &str, format: &str, output: Optio
         .map(|msg| {
             let parts = parts_map
                 .iter()
-                .find(|(mid, _)| *mid == msg.id)
+                .find(|(mid, _)| **mid == msg.id)
                 .map(|(_, parts)| parts.clone())
                 .unwrap_or_default();
             models::MessageWithParts { message: msg, parts }
@@ -1022,6 +1028,9 @@ fn cmd_completion(shell: &str) -> Result<()> {
 }
 
 /// Atomic file write: creates parent dirs, writes to .tmp, then renames
+///
+/// Uses O_EXCL to prevent symlink races (TOCTOU) — if a symlink already
+/// exists at the temp path, the write fails instead of following it.
 fn safe_write(path: &str, content: &str) -> Result<()> {
     if path.contains("..") {
         bail!("Output path must not contain '..': {path}");
@@ -1034,8 +1043,15 @@ fn safe_write(path: &str, content: &str) -> Result<()> {
         }
     }
     let tmp_path = format!("{path}.tmp");
-    std::fs::write(&tmp_path, content)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&tmp_path)
+        .with_context(|| format!("Failed to create temporary file {tmp_path}"))?;
+    file.write_all(content.as_bytes())
         .with_context(|| format!("Failed to write to {tmp_path}"))?;
+    file.flush()?;
     std::fs::rename(&tmp_path, path)
         .with_context(|| format!("Failed to rename {tmp_path} to {path}"))?;
     Ok(())
