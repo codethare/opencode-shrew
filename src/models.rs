@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
@@ -16,11 +14,14 @@ pub struct Session {
     pub summary_files: Option<i64>,
     pub model: Option<String>,
     pub msg_count: i64,
+    #[serde(default)]
+    pub total_cost: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: String,
+    #[allow(dead_code)]
     pub session_id: String,
     pub time_created: i64,
     pub data: MessageData,
@@ -44,8 +45,10 @@ pub struct MessageData {
     pub tokens: Option<TokenUsage>,
     #[serde(default)]
     pub cost: Option<f64>,
+    #[allow(dead_code)]
     #[serde(default)]
     pub mode: Option<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     pub parent_id: Option<String>,
 }
@@ -256,4 +259,24 @@ pub struct ProjectGroup {
     pub session_count: i64,
     pub total_messages: i64,
     pub last_active: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoTagRule {
+    pub id: String,
+    pub tag: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_contains: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir_contains: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_messages: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_messages: Option<i64>,
 }
