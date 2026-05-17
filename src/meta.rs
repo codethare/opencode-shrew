@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+
+use crate::models::{AutoTagRule, Session};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OcsMeta {
@@ -9,6 +13,8 @@ pub struct OcsMeta {
     pub tags: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub notes: HashMap<String, String>,
+    #[serde(default)]
+    pub autotag_rules: Vec<AutoTagRule>,
 }
 
 
@@ -26,6 +32,7 @@ pub fn load_meta() -> Result<OcsMeta> {
         return Ok(OcsMeta {
             tags: HashMap::new(),
             notes: HashMap::new(),
+            autotag_rules: Vec::new(),
         });
     }
     let content = std::fs::read_to_string(&path)
@@ -42,10 +49,17 @@ pub fn save_meta(meta: &OcsMeta) -> Result<()> {
             .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
     }
     let content = serde_json::to_string_pretty(meta)?;
-    // Atomic write: temp file + rename to prevent corruption on crash
+    // Atomic write via O_EXCL temp + rename — prevents symlink races (TOCTOU)
     let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &content)
-        .with_context(|| format!("Failed to write meta file: {}", tmp_path.display()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&tmp_path)
+        .with_context(|| format!("Failed to create meta temp file: {}", tmp_path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write meta temp file: {}", tmp_path.display()))?;
+    file.flush()?;
     std::fs::rename(&tmp_path, &path)
         .with_context(|| format!("Failed to rename meta file: {}", path.display()))?;
     Ok(())
@@ -125,6 +139,91 @@ pub fn list_annotated_ids() -> Result<Vec<String>> {
     let mut ids: Vec<String> = meta.notes.keys().cloned().collect();
     ids.sort();
     Ok(ids)
+}
+
+/// Check if a session matches a single autotag rule
+pub fn rule_matches(session: &Session, rule: &AutoTagRule) -> bool {
+    if let Some(ref kw) = rule.title_contains {
+        if !session.title.to_lowercase().contains(&kw.to_lowercase()) {
+            return false;
+        }
+    }
+    if let Some(ref dir) = rule.dir_contains {
+        if !session.directory.to_lowercase().contains(&dir.to_lowercase()) {
+            return false;
+        }
+    }
+    if let Some(ref m) = rule.model {
+        if session.model.as_deref().map_or(true, |model| {
+            !model.to_lowercase().contains(&m.to_lowercase())
+        }) {
+            return false;
+        }
+    }
+    if let Some(min) = rule.min_cost {
+        if session.total_cost < min {
+            return false;
+        }
+    }
+    if let Some(max) = rule.max_cost {
+        if session.total_cost > max {
+            return false;
+        }
+    }
+    if let Some(min) = rule.min_messages {
+        if session.msg_count < min {
+            return false;
+        }
+    }
+    if let Some(max) = rule.max_messages {
+        if session.msg_count > max {
+            return false;
+        }
+    }
+    true
+}
+
+// ── Autotag rule management ──────────────────────────────────────────
+
+pub fn list_autotag_rules() -> Result<Vec<AutoTagRule>> {
+    let meta = load_meta()?;
+    Ok(meta.autotag_rules)
+}
+
+pub fn add_autotag_rule(rule: AutoTagRule) -> Result<()> {
+    let mut meta = load_meta()?;
+    meta.autotag_rules.push(rule);
+    save_meta(&meta)
+}
+
+pub fn remove_autotag_rule(rule_id: &str) -> Result<bool> {
+    let mut meta = load_meta()?;
+    let len_before = meta.autotag_rules.len();
+    meta.autotag_rules.retain(|r| r.id != rule_id);
+    let removed = meta.autotag_rules.len() < len_before;
+    if removed {
+        save_meta(&meta)?;
+    }
+    Ok(removed)
+}
+
+/// Apply autotag rules to a session. Returns the list of tags that were added.
+pub fn apply_rules_to_session(session: &Session) -> Result<Vec<String>> {
+    let mut meta = load_meta()?;
+    let mut added = Vec::new();
+    for rule in &meta.autotag_rules {
+        if rule_matches(session, rule) {
+            let tags = meta.tags.entry(session.id.clone()).or_default();
+            if !tags.contains(&rule.tag) {
+                tags.push(rule.tag.clone());
+                added.push(rule.tag.clone());
+            }
+        }
+    }
+    if !added.is_empty() {
+        save_meta(&meta)?;
+    }
+    Ok(added)
 }
 
 pub fn all_tags() -> Result<Vec<(String, usize)>> {
