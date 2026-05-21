@@ -51,6 +51,7 @@ pub fn save_meta(meta: &OcsMeta) -> Result<()> {
     let content = serde_json::to_string_pretty(meta)?;
     // Atomic write via O_EXCL temp + rename — prevents symlink races (TOCTOU)
     let tmp_path = path.with_extension("json.tmp");
+    let _ = std::fs::remove_file(&tmp_path);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

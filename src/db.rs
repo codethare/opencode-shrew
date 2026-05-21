@@ -142,13 +142,6 @@ pub fn get_data_version(conn: &Connection) -> Result<i64> {
     Ok(val)
 }
 
-pub fn get_message_count(conn: &Connection, session_id: &str) -> Result<i64> {
-    let sql = "SELECT COUNT(*) FROM message WHERE session_id = ?1";
-    let mut stmt = conn.prepare(sql)?;
-    let count: i64 = stmt.query_row([session_id], |row| row.get(0))?;
-    Ok(count)
-}
-
 pub fn list_sessions_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Session>> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -231,6 +224,7 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
         None => Ok(None),
     }
 }
+
 
 pub fn get_related_sessions(conn: &Connection, id: &str, directory: &str, limit: i64) -> Result<Vec<Session>> {
     let sql = "SELECT s.id, s.project_id, s.slug, s.directory, s.title, \
@@ -354,6 +348,75 @@ pub fn get_parts_batch(conn: &Connection, message_ids: &[String]) -> Result<std:
 
 pub fn get_messages_with_parts(conn: &Connection, session_id: &str) -> Result<Vec<MessageWithParts>> {
     let messages = get_messages(conn, session_id)?;
+    let msg_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+    let mut parts_map = get_parts_batch(conn, &msg_ids)?;
+    Ok(messages
+        .into_iter()
+        .map(|msg| {
+            let msg_id = msg.id.clone();
+            MessageWithParts {
+                message: msg,
+                parts: parts_map.remove(&msg_id).unwrap_or_default(),
+            }
+        })
+        .collect())
+}
+
+pub fn get_message_count(conn: &Connection, session_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM message WHERE session_id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn get_messages_range(
+    conn: &Connection,
+    session_id: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<Message>> {
+    let sql = "SELECT id, session_id, time_created, data \
+               FROM message WHERE session_id = ?1 \
+               ORDER BY time_created ASC, id ASC \
+               LIMIT ?2 OFFSET ?3";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![session_id, limit, offset], |row| {
+        let data_str: String = row.get("data")?;
+        let data: MessageData = serde_json::from_str(&data_str).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to parse message data JSON: {e}");
+            MessageData {
+                role: "unknown".to_string(),
+                agent: None,
+                model: None,
+                tokens: None,
+                cost: None,
+                mode: None,
+                parent_id: None,
+            }
+        });
+        Ok(Message {
+            id: row.get("id")?,
+            session_id: row.get("session_id")?,
+            time_created: row.get("time_created")?,
+            data,
+        })
+    })?;
+    let mut messages = Vec::new();
+    for row in rows {
+        messages.push(row?);
+    }
+    Ok(messages)
+}
+
+pub fn get_messages_with_parts_range(
+    conn: &Connection,
+    session_id: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<MessageWithParts>> {
+    let messages = get_messages_range(conn, session_id, offset, limit)?;
     let msg_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
     let mut parts_map = get_parts_batch(conn, &msg_ids)?;
     Ok(messages
