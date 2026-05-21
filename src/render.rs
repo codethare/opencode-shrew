@@ -1,4 +1,11 @@
 use chrono::DateTime;
+use std::sync::OnceLock;
+
+use regex::Regex;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+use syntect::util::as_24_bit_terminal_escaped;
 
 use crate::models::*;
 use std::fmt::Write;
@@ -42,6 +49,14 @@ pub fn render_session_list_compact(sessions: &[Session]) -> Vec<String> {
 
 /// Render a full session with its messages as markdown
 pub fn render_session_detail(session: &Session, messages: &[MessageWithParts], show_tools: bool) -> String {
+    let mut out = render_session_header(session);
+    for msg_with_parts in messages {
+        render_message(&mut out, msg_with_parts, show_tools);
+    }
+    out
+}
+
+pub fn render_session_header(session: &Session) -> String {
     let mut out = String::new();
     let model = session.model.as_deref().unwrap_or("unknown");
     let created_ts = ts_to_iso_short(session.time_created);
@@ -64,9 +79,13 @@ pub fn render_session_detail(session: &Session, messages: &[MessageWithParts], s
         }
     }
     out.push_str("\n---\n\n");
+    out
+}
 
-    for msg_with_parts in messages {
-        render_message(&mut out, msg_with_parts, show_tools);
+pub fn render_message_batch(messages: &[MessageWithParts], show_tools: bool) -> String {
+    let mut out = String::new();
+    for msg in messages {
+        render_message(&mut out, msg, show_tools);
     }
     out
 }
@@ -947,4 +966,182 @@ fn ts_to_time(ts: i64) -> String {
         Some(dt) => dt.format("%H:%M:%S").to_string(),
         None => String::new(),
     }
+}
+
+struct HighlightResources {
+    ss: SyntaxSet,
+    ts: ThemeSet,
+}
+
+fn highlight_resources() -> &'static HighlightResources {
+    static RES: OnceLock<HighlightResources> = OnceLock::new();
+    RES.get_or_init(|| HighlightResources {
+        ss: SyntaxSet::load_defaults_newlines(),
+        ts: ThemeSet::load_defaults(),
+    })
+}
+
+fn code_block_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?ms)^```(\w*)\n(.*?)^```\s*$").unwrap())
+}
+
+/// Apply ANSI terminal styling to markdown session output for TUI-like readability.
+/// Highlights headers, metadata, inline elements — skips code fences for syntect.
+pub fn apply_terminal_styles(text: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    const BOLD: &str = "\x1b[1m";
+    const DIM: &str = "\x1b[2m";
+    const BRIGHT_GREEN: &str = "\x1b[92m";
+    const YELLOW: &str = "\x1b[33m";
+    const RESET: &str = "\x1b[0m";
+
+    /// Line-level: # Title → bold
+    fn h1_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"(?m)^# (.+)$").unwrap())
+    }
+    /// Line-level: ## Header → bold bright green
+    fn h2_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"(?m)^## (.+)$").unwrap())
+    }
+    /// Line-level: --- → dim
+    fn sep_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"(?m)^-{3,}\s*$").unwrap())
+    }
+    /// Inline: `code` → cyan (strip backticks)
+    fn bt_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"`([^`]+)`").unwrap())
+    }
+    /// Inline: **bold** → bold (strip **)
+    fn bold_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"\*\*([^*]+)\*\*").unwrap())
+    }
+    /// Inline: (+N/-M) → green +N / red -M
+    fn diff_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"\((\+)(\d+)/-(\d+)\)").unwrap())
+    }
+    /// Inline: $0.0000 → yellow
+    fn cost_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"\$[0-9]+\.[0-9]+").unwrap())
+    }
+    /// Inline: N tokens → magenta
+    fn tok_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"\b[0-9]+ tokens\b").unwrap())
+    }
+    /// Line-level: > ⏹ Finished ... → bold yellow
+    fn fin_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"(?m)^> ⏹ .+$").unwrap())
+    }
+
+    let s = h1_re().replace_all(text, |caps: &regex::Captures| {
+        format!("{BOLD}{}{RESET}", &caps[1])
+    });
+    let s = h2_re().replace_all(&s, |caps: &regex::Captures| {
+        format!("{BRIGHT_GREEN}{BOLD}{}{RESET}", &caps[1])
+    });
+    let s = sep_re().replace_all(&s, |caps: &regex::Captures| {
+        format!("{DIM}{}{RESET}", &caps[0])
+    });
+    let s = fin_re().replace_all(&s, |caps: &regex::Captures| {
+        format!("{BOLD}{YELLOW}{}{RESET}", &caps[0])
+    });
+
+    // Inline styles (inside non-code regions)
+    fn style_inline(s: &str) -> String {
+        const CYAN: &str = "\x1b[96m";
+        const BOLD: &str = "\x1b[1m";
+        const BOLD_OFF: &str = "\x1b[22m";
+        const GREEN: &str = "\x1b[32m";
+        const RED: &str = "\x1b[31m";
+        const YELLOW: &str = "\x1b[33m";
+        const MAGENTA: &str = "\x1b[35m";
+        const RESET: &str = "\x1b[0m";
+
+        let s = bt_re().replace_all(s, |caps: &regex::Captures| {
+            format!("{CYAN}{}{RESET}", &caps[1])
+        });
+        let s = bold_re().replace_all(&s, |caps: &regex::Captures| {
+            format!("{BOLD}{}{BOLD_OFF}", &caps[1])
+        });
+        let s = diff_re().replace_all(&s, |caps: &regex::Captures| {
+            format!("({GREEN}+{}{RESET}/{RED}-{}{RESET})", &caps[2], &caps[3])
+        });
+        let s = cost_re().replace_all(&s, |caps: &regex::Captures| {
+            format!("{YELLOW}{}{RESET}", &caps[0])
+        });
+        let s = tok_re().replace_all(&s, |caps: &regex::Captures| {
+            format!("{MAGENTA}{}{RESET}", &caps[0])
+        });
+        s.into_owned()
+    }
+
+    let cb_re = code_block_re();
+    let mut result = String::with_capacity(s.len() + 256);
+    let mut last = 0;
+    for cap in cb_re.captures_iter(&s) {
+        let m = cap.get(0).unwrap();
+        result.push_str(&style_inline(&s[last..m.start()]));
+        result.push_str(m.as_str());
+        last = m.end();
+    }
+    result.push_str(&style_inline(&s[last..]));
+    result
+}
+
+/// Apply ANSI syntax highlighting to fenced code blocks (```lang ... ```) in text.
+/// Only affects terminal output — no highlighting for JSON/markdown export.
+pub fn highlight_code_blocks(text: &str) -> String {
+    let re = code_block_re();
+    let res = highlight_resources();
+    let theme = &res.ts.themes["base16-ocean.dark"];
+
+    let mut last_end = 0;
+    let mut result = String::new();
+
+    for cap in re.captures_iter(text) {
+        let m = cap.get(0).unwrap();
+        result.push_str(&text[last_end..m.start()]);
+
+        let lang = cap.get(1).map_or("", |m| m.as_str());
+        let code = cap.get(2).map_or("", |m| m.as_str());
+
+        let syntax = res
+            .ss
+            .find_syntax_by_token(lang)
+            .unwrap_or_else(|| res.ss.find_syntax_plain_text());
+
+        let mut highlighter = HighlightLines::new(syntax, theme);
+
+        for line in code.lines() {
+            if let Ok(ranges) = highlighter.highlight_line(line, &res.ss) {
+                result.push_str(&as_24_bit_terminal_escaped(&ranges, false));
+            } else {
+                result.push_str(line);
+            }
+            result.push('\n');
+        }
+
+        last_end = m.end();
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// Strip ANSI escape codes from text (e.g. from subprocess output).
+pub fn strip_ansi(text: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap());
+    re.replace_all(text, "").into_owned()
 }
