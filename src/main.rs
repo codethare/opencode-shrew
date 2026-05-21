@@ -6,13 +6,16 @@ mod render;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use clap_complete::generate;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set to true when we intentionally exit after subprocess completion
 static SUBPROCESS_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Number of lines scrolled per mouse wheel event (industry standard: 3 lines)
+const SCROLL_LINES: usize = 3;
 
 #[derive(Parser)]
 #[command(name = "ocs", version, about = "OpenCode session viewer - browse opencode sessions directly from SQLite")]
@@ -150,8 +153,8 @@ enum Commands {
 
     /// Run opencode as a subprocess (session-aware wrapper around `opencode run`)
     Run {
-        /// Message or prompt to send
-        message: String,
+        /// Message or prompt to send (omit for interactive input, or use --input/-I for dialoguer prompt)
+        message: Option<String>,
 
         /// Continue this session (auto-sets --dir from DB)
         #[arg(short, long)]
@@ -164,6 +167,18 @@ enum Commands {
         /// Interactive mode: pick session from peco/fzf
         #[arg(short, long)]
         interactive: bool,
+
+        /// Open interactive prompt to compose the message
+        #[arg(short = 'I', long)]
+        input: bool,
+
+        /// Continue the most recently updated session (maps to opencode -c)
+        #[arg(short = 'c', long = "continue")]
+        continue_flag: bool,
+
+        /// Open $EDITOR/nvim to compose the message
+        #[arg(short = 'e', long)]
+        edit: bool,
     },
 
     /// Show top sessions by cost, tokens, or message count
@@ -331,8 +346,8 @@ fn main() -> Result<()> {
         Commands::Diff { id } => {
             cmd_diff(&conn, &id)
         }
-        Commands::Run { message, session, fork, interactive } => {
-            cmd_run(&conn, &message, session.as_deref(), fork, interactive)
+        Commands::Run { message, session, fork, interactive, input, continue_flag, edit } => {
+            cmd_run(&conn, message.as_deref(), session.as_deref(), fork, interactive, input, continue_flag, edit)
         }
         Commands::Top { limit, by, json } => {
             cmd_top(&conn, limit, &by, json)
@@ -480,6 +495,14 @@ fn cmd_show(conn: &rusqlite::Connection, id: &str, raw: bool, show_tools: bool, 
     let session = db::get_session(conn, id)?
         .with_context(|| format!("Session not found: {id}"))?;
 
+    let note = match meta::get_note(id) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Warning: could not read annotation: {e}");
+            None
+        }
+    };
+
     if raw {
         let messages = db::get_messages(conn, id)?;
         let msg_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
@@ -500,6 +523,11 @@ fn cmd_show(conn: &rusqlite::Connection, id: &str, raw: bool, show_tools: bool, 
         return Ok(());
     }
 
+    let total = db::get_message_count(conn, id)?;
+    if total > 20 {
+        return interactive_pager(conn, &session, show_tools, note);
+    }
+
     let messages = db::get_messages(conn, id)?;
     let msg_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
     let parts_map = db::get_parts_batch(conn, &msg_ids)?;
@@ -515,18 +543,13 @@ fn cmd_show(conn: &rusqlite::Connection, id: &str, raw: bool, show_tools: bool, 
         })
         .collect();
 
-    let note = match meta::get_note(id) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("Warning: could not read annotation: {e}");
-            None
-        }
-    };
     let output = render::render_session_detail(&session, &messages_with_parts, show_tools);
     if let Some(ref n) = note {
         println!("📝 *Annotation*: {}\n{}\n", n, "-".repeat(60));
     }
-    println!("{output}");
+    let styled = render::apply_terminal_styles(&output);
+    let highlighted = render::highlight_code_blocks(&styled);
+    println!("{highlighted}");
     Ok(())
 }
 
@@ -645,7 +668,7 @@ fn cmd_stats(conn: &rusqlite::Connection, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(conn: &rusqlite::Connection, message: &str, session: Option<&str>, fork: bool, interactive: bool) -> Result<()> {
+fn cmd_run(conn: &rusqlite::Connection, message: Option<&str>, session: Option<&str>, fork: bool, interactive: bool, input: bool, cont: bool, edit: bool) -> Result<()> {
     if which("opencode").is_err() {
         bail!("'opencode' binary not found in PATH.");
     }
@@ -687,15 +710,773 @@ fn cmd_run(conn: &rusqlite::Connection, message: &str, session: Option<&str>, fo
         cmd.arg("--fork");
     }
 
-    cmd.arg(message);
+    if cont {
+        cmd.arg("-c");
+    }
 
-    cmd.stdin(Stdio::inherit());
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
+    let mut current_sid = sid;
+    let mut first_run = true;
 
-    let status = cmd.status().with_context(|| "Failed to execute 'opencode run'")?;
-    SUBPROCESS_EXIT.store(true, Ordering::Relaxed);
-    std::process::exit(status.code().unwrap_or(1));
+    loop {
+        let prompt = if first_run {
+            match message {
+                Some(msg) => Some(msg.to_string()),
+                None if edit => {
+                    let p = read_editor_input()?;
+                    if p.trim().is_empty() { None } else { Some(p) }
+                }
+                None if input => {
+                    let p = read_multiline_input()?;
+                    if p.trim().is_empty() { None } else { Some(p) }
+                }
+                _ => None,
+            }
+        } else if input {
+            let p = read_multiline_input()?;
+            if p.trim().is_empty() { None } else { Some(p) }
+        } else {
+            None
+        };
+
+        let Some(p) = prompt else {
+            cmd.stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            let status = cmd.status().with_context(|| "Failed to execute 'opencode run'")?;
+            SUBPROCESS_EXIT.store(true, Ordering::Relaxed);
+            std::process::exit(status.code().unwrap_or(1));
+        };
+
+        let mut iter_cmd = Command::new("opencode");
+        iter_cmd.arg("run");
+
+        if !current_sid.is_empty() {
+            iter_cmd.arg("-s").arg(&current_sid);
+            if let Ok(Some(s)) = db::get_session(conn, &current_sid) {
+                if !s.directory.is_empty() {
+                    if s.directory.contains('\0') || s.directory.len() > 4096 {
+                        eprintln!("Warning: invalid directory in DB for session {current_sid}, skipping --dir");
+                    } else {
+                        iter_cmd.arg("--dir").arg(&s.directory);
+                    }
+                }
+            }
+        } else if cont || !first_run {
+            iter_cmd.arg("-c");
+        }
+
+        if fork {
+            iter_cmd.arg("--fork");
+        }
+
+        // Pipe prompt via stdin to prevent subagent cancellation.
+        let mut child = iter_cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| "Failed to execute 'opencode run'")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(p.as_bytes())?;
+        }
+
+        let mut output = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            let mut limited = out.take(10 * 1024 * 1024);
+            limited.read_to_end(&mut output)?;
+        }
+        let status = child.wait()?;
+
+        let raw_str = String::from_utf8_lossy(&output);
+        let cleaned = render::strip_ansi(&raw_str);
+        let styled = render::apply_terminal_styles(&cleaned);
+        let highlighted = render::highlight_code_blocks(&styled);
+        let (_, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
+        let visible_h = term_height.saturating_sub(1) as usize;
+        let lines: Vec<&str> = highlighted.lines().collect();
+
+        if lines.is_empty() || lines.len() <= visible_h {
+            print!("{highlighted}");
+        } else {
+            let owned: Vec<String> = lines.into_iter().map(|l| l.to_string()).collect();
+            run_text_pager(&owned)?;
+        }
+
+        if first_run && current_sid.is_empty() {
+            let recent = db::list_sessions(conn, 1, None, None, None, None, None, false)
+                .unwrap_or_default();
+            if let Some(s) = recent.first() {
+                current_sid = s.id.clone();
+            }
+        }
+        first_run = false;
+
+        if input {
+            use std::io::Write as _;
+            let mut line = String::new();
+            print!("\n\x1b[2m[u]ndo last msg  [Enter] next msg  [q]uit:\x1b[0m ");
+            std::io::stdout().flush()?;
+            std::io::stdin().read_line(&mut line)?;
+            match line.trim().to_lowercase().as_str() {
+                "u" => {
+                    if let Ok(rw) = db::open_db_rw(None) {
+                        if let Ok(msgs) = db::get_messages(&rw, &current_sid) {
+                            if let Some(last) = msgs.iter().rev().find(|m| m.data.role == "user") {
+                                let _ = rw.execute(
+                                    "DELETE FROM part WHERE message_id = ?1",
+                                    rusqlite::params![last.id],
+                                );
+                                let _ = rw.execute(
+                                    "DELETE FROM message WHERE id = ?1",
+                                    rusqlite::params![last.id],
+                                );
+                                println!("\x1b[2m✓ Undone. Type replacement below:\x1b[0m");
+                            }
+                        }
+                    }
+                    continue;
+                }
+                "" => {
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        SUBPROCESS_EXIT.store(true, Ordering::Relaxed);
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn redraw_input(stdout: &mut std::io::Stdout, buffer: &str) -> std::io::Result<()> {
+    use crossterm::cursor;
+    use crossterm::execute;
+    use crossterm::terminal::{Clear, ClearType};
+    execute!(stdout, cursor::RestorePosition, Clear(ClearType::FromCursorDown))?;
+    // Raw mode: \n alone doesn't return to column 0. Use \r\n for newlines.
+    for line in buffer.lines() {
+        write!(stdout, "{line}\r\n")?;
+    }
+    // If buffer ends with \n, the loop above would have emitted an extra \r\n
+    // for the empty segment. But lines() strips the trailing delimiter, so we
+    // need to detect a trailing \n and emit one more \r\n.
+    if buffer.ends_with('\n') {
+        write!(stdout, "\r\n")?;
+    }
+    stdout.flush()
+}
+
+fn read_editor_input() -> Result<String> {
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "nvim".to_string());
+    let tmp = format!("/tmp/ocs_prompt_{}.md", std::process::id());
+    std::fs::write(&tmp, "")?;
+    let status = Command::new(&editor)
+        .arg(&tmp)
+        .status()
+        .with_context(|| format!("Failed to launch editor '{editor}'"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("Editor exited unsuccessfully.");
+    }
+    let content = std::fs::read_to_string(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(content)
+}
+
+fn read_multiline_input() -> Result<String> {
+    use crossterm::cursor;
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::execute;
+    use crossterm::terminal;
+
+    let mut stdout = std::io::stdout();
+    terminal::enable_raw_mode()?;
+    struct RawGuard;
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+    let _guard = RawGuard;
+
+    // Save position so redraw_input can restore to start of input
+    execute!(stdout, cursor::SavePosition)?;
+
+    let mut buffer = String::new();
+    let result: Result<String> = loop {
+        match event::read() {
+            Ok(Event::Key(key)) => match (key.code, key.modifiers) {
+                (KeyCode::Enter, mods) if mods == KeyModifiers::SHIFT => {
+                    buffer.push('\n');
+                    let _ = redraw_input(&mut stdout, &buffer);
+                }
+                (KeyCode::Enter, _) => break Ok(buffer),
+                (KeyCode::Backspace, _) if !buffer.is_empty() => {
+                    buffer.pop();
+                    let _ = redraw_input(&mut stdout, &buffer);
+                }
+                (KeyCode::Char(c), mods)
+                    if mods == KeyModifiers::CONTROL && (c == 'c' || c == 'd') =>
+                {
+                    bail!("Input cancelled.");
+                }
+                (KeyCode::Char(c), _) if !c.is_control() => {
+                    buffer.push(c);
+                    let _ = redraw_input(&mut stdout, &buffer);
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(e) => bail!("Terminal input error: {e}"),
+        }
+    };
+
+    drop(_guard);
+    println!();
+    result
+}
+
+fn truncate_ansi(line: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut visible = 0usize;
+    let mut escaped = false;
+    let mut result = String::with_capacity(line.len());
+    for c in line.chars() {
+        if escaped {
+            result.push(c);
+            if c == 'm' {
+                escaped = false;
+            }
+            continue;
+        }
+        if c == '\x1b' {
+            escaped = true;
+            result.push(c);
+            continue;
+        }
+        if visible >= max_width {
+            // Still in ANSI escape? keep going until 'm'
+            continue;
+        }
+        visible += 1;
+        result.push(c);
+    }
+    // Close any unterminated ANSI at truncation boundary
+    if escaped {
+        result.push('m');
+    }
+    result
+}
+
+fn pager_load_batch_at(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    show_tools: bool,
+    offset: i64,
+    count: i64,
+    all_lines: &mut Vec<String>,
+    insert_pos: usize,
+) -> Result<usize> {
+    let msgs = db::get_messages_with_parts_range(conn, session_id, offset, count)?;
+    let before = all_lines.len();
+    let mut batch: Vec<String> = Vec::new();
+    for msg in &msgs {
+        let text = render::render_message_batch(&[msg.clone()], show_tools);
+        let styled = render::apply_terminal_styles(&text);
+        let highlighted = render::highlight_code_blocks(&styled);
+        for line in highlighted.lines() {
+            batch.push(line.to_string());
+        }
+    }
+    // Splice at insert_pos (chronological order)
+    let mut tail = all_lines.split_off(insert_pos);
+    all_lines.append(&mut batch);
+    all_lines.append(&mut tail);
+    let added = all_lines.len() - before;
+    Ok(added)
+}
+
+fn interactive_pager(
+    conn: &rusqlite::Connection,
+    session: &models::Session,
+    show_tools: bool,
+    note: Option<String>,
+) -> Result<()> {
+    use crossterm::cursor;
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
+    use crossterm::execute;
+    use crossterm::terminal::{self, Clear, ClearType};
+    use std::io::Write as _;
+
+    const BATCH_SIZE: i64 = 50;
+    const LOAD_THRESHOLD: usize = 5;
+
+    let total_msgs = db::get_message_count(conn, &session.id)?;
+    let mut all_lines: Vec<String> = Vec::new();
+    let header_count: usize;
+
+    // Render header + note with terminal styles (no code highlighting)
+    {
+        let header_str = render::render_session_header(session);
+        let styled_header = render::apply_terminal_styles(&header_str);
+        for line in styled_header.lines() {
+            all_lines.push(line.to_string());
+        }
+        if let Some(ref n) = note {
+            all_lines.push(String::new());
+            all_lines.push(format!("\x1b[33m📝 Annotation: {}\x1b[0m", n));
+            all_lines.push("\x1b[2m————————————————————————————————\x1b[0m".to_string());
+            all_lines.push(String::new());
+        }
+        header_count = all_lines.len();
+    }
+
+    terminal::enable_raw_mode()?;
+    execute!(std::io::stdout(), event::EnableMouseCapture)?;
+    struct PagerGuard;
+    impl Drop for PagerGuard {
+        fn drop(&mut self) {
+            let _ = terminal::disable_raw_mode();
+            let _ = execute!(std::io::stdout(), event::DisableMouseCapture);
+        }
+    }
+    let _guard = PagerGuard;
+    let mut stdout = std::io::stdout();
+
+    // Load initial batch from the END (most recent messages first)
+    let mut load_offset: i64 = if total_msgs > 0 {
+        let batch = std::cmp::min(BATCH_SIZE, total_msgs);
+        total_msgs - batch
+    } else {
+        0
+    };
+    if total_msgs > 0 {
+        let count = total_msgs - load_offset;
+        let _ = pager_load_batch_at(
+            conn, &session.id, show_tools, load_offset, count,
+            &mut all_lines, header_count,
+        );
+    }
+
+    // Start at bottom so most recent content is visible first
+    let mut scroll_pos: usize = {
+        if let Ok((_, term_height)) = terminal::size() {
+            let visible_h = term_height.saturating_sub(1) as usize;
+            if all_lines.len() > visible_h {
+                all_lines.len() - visible_h
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    };
+
+    // Search state
+    let mut search_mode = false;
+    let mut search_query = String::new();
+    let mut search_matches: Vec<usize> = Vec::new();
+    let mut search_current: usize = 0;
+
+    let result: Result<()> = loop {
+        // Auto-load earlier batches when scrolling near the top of loaded content
+        if scroll_pos <= header_count + LOAD_THRESHOLD && load_offset > 0 {
+            let count = std::cmp::min(BATCH_SIZE, load_offset);
+            let new_offset = load_offset - count;
+            if let Ok(added) = pager_load_batch_at(
+                conn, &session.id, show_tools, new_offset, count,
+                &mut all_lines, header_count,
+            ) {
+                scroll_pos += added;
+                load_offset = new_offset;
+            }
+        }
+
+        let (term_width, term_height) = terminal::size()?;
+        let visible_h = term_height.saturating_sub(1) as usize;
+
+        if all_lines.len() > visible_h && scroll_pos + visible_h > all_lines.len() {
+            scroll_pos = all_lines.len() - visible_h;
+        } else if all_lines.len() <= visible_h {
+            scroll_pos = 0;
+        }
+
+        let end = scroll_pos + visible_h;
+        let end = std::cmp::min(end, all_lines.len());
+
+        execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+        for (rel_idx, line) in all_lines[scroll_pos..end].iter().enumerate() {
+            let abs_idx = scroll_pos + rel_idx;
+            let display = truncate_ansi(line, term_width as usize);
+            if !search_matches.is_empty()
+                && search_current < search_matches.len()
+                && abs_idx == search_matches[search_current]
+            {
+                write!(stdout, "\x1b[7m{}\x1b[0m\r\n", display)?;
+            } else {
+                write!(stdout, "{}\r\n", display)?;
+            }
+        }
+
+        let loaded_count = total_msgs - load_offset;
+        let status = if search_mode {
+            format!("\x1b[7m /{} \x1b[0m", search_query)
+        } else if !search_matches.is_empty() {
+            format!(
+                "\x1b[7m {} | msgs:{}/{} | L{}-{}/{} | match {}/{} | n/N \x1b[0m",
+                session.id, loaded_count, total_msgs,
+                scroll_pos + 1, end, all_lines.len(),
+                search_current + 1, search_matches.len(),
+            )
+        } else {
+            format!(
+                "\x1b[7m {} | msgs:{}/{} | L{}-{}/{} | ↑↓ PgUp PgDn Ctrl+U/D g G / q \x1b[0m",
+                session.id, loaded_count, total_msgs,
+                scroll_pos + 1, end, all_lines.len(),
+            )
+        };
+        let truncated: String = status.chars().take(term_width as usize).collect();
+        write!(stdout, "\x1b[{};1H{}", term_height, truncated)?;
+        stdout.flush()?;
+
+        match event::read() {
+            Ok(Event::Key(key)) => {
+                if search_mode {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char(c), _) if !c.is_control() => {
+                            search_query.push(c);
+                        }
+                        (KeyCode::Backspace, _) => {
+                            search_query.pop();
+                        }
+                        (KeyCode::Enter, _) => {
+                            search_matches.clear();
+                            search_current = 0;
+                            if !search_query.is_empty() {
+                                let lower = search_query.to_lowercase();
+                                for (i, line) in all_lines.iter().enumerate() {
+                                    let plain = render::strip_ansi(line);
+                                    if plain.to_lowercase().contains(&lower) {
+                                        search_matches.push(i);
+                                    }
+                                }
+                                if !search_matches.is_empty() {
+                                    search_current = 0;
+                                    scroll_pos = search_matches[0];
+                                    if scroll_pos + visible_h > all_lines.len() {
+                                        scroll_pos = all_lines.len().saturating_sub(visible_h);
+                                    }
+                                }
+                            }
+                            search_mode = false;
+                        }
+                        (KeyCode::Esc, _) => {
+                            search_mode = false;
+                            search_query.clear();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) if scroll_pos > 0 => {
+                            scroll_pos -= 1;
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _)
+                            if scroll_pos + visible_h < all_lines.len() =>
+                        {
+                            scroll_pos += 1;
+                        }
+                        (KeyCode::PageUp, _) => {
+                            scroll_pos = scroll_pos.saturating_sub(visible_h);
+                        }
+                        (KeyCode::PageDown, _) => {
+                            scroll_pos = std::cmp::min(
+                                scroll_pos + visible_h,
+                                all_lines.len().saturating_sub(visible_h),
+                            );
+                        }
+                        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                            let half = (visible_h / 2).max(1);
+                            scroll_pos = scroll_pos.saturating_sub(half);
+                        }
+                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                            let half = (visible_h / 2).max(1);
+                            scroll_pos = std::cmp::min(
+                                scroll_pos + half,
+                                all_lines.len().saturating_sub(visible_h),
+                            );
+                        }
+                        (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
+                            while load_offset > 0 {
+                                let count = std::cmp::min(BATCH_SIZE, load_offset);
+                                let new_offset = load_offset - count;
+                                if pager_load_batch_at(
+                                    conn, &session.id, show_tools, new_offset, count,
+                                    &mut all_lines, header_count,
+                                ).is_ok() {
+                                    load_offset = new_offset;
+                                } else {
+                                    break;
+                                }
+                            }
+                            scroll_pos = 0;
+                        }
+                        (KeyCode::End, _) | (KeyCode::Char('G'), _) => {
+                            while load_offset > 0 {
+                                let count = std::cmp::min(BATCH_SIZE, load_offset);
+                                let new_offset = load_offset - count;
+                                if pager_load_batch_at(
+                                    conn, &session.id, show_tools, new_offset, count,
+                                    &mut all_lines, header_count,
+                                ).is_ok() {
+                                    load_offset = new_offset;
+                                } else {
+                                    break;
+                                }
+                            }
+                            scroll_pos = all_lines.len().saturating_sub(visible_h);
+                        }
+                        (KeyCode::Char('/'), _) => {
+                            search_mode = true;
+                            search_query.clear();
+                        }
+                        (KeyCode::Char('n'), _) if !search_matches.is_empty() => {
+                            search_current = (search_current + 1) % search_matches.len();
+                            scroll_pos = search_matches[search_current];
+                        }
+                        (KeyCode::Char('N'), _) if !search_matches.is_empty() => {
+                            search_current = if search_current == 0 {
+                                search_matches.len() - 1
+                            } else {
+                                search_current - 1
+                            };
+                            scroll_pos = search_matches[search_current];
+                        }
+                        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => break Ok(()),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Resize(_, _)) => {}
+            Ok(Event::Mouse(me)) => match me.kind {
+                MouseEventKind::ScrollUp if scroll_pos > 0 => {
+                    scroll_pos = scroll_pos.saturating_sub(SCROLL_LINES);
+                }
+                MouseEventKind::ScrollDown
+                    if scroll_pos + visible_h < all_lines.len() =>
+                {
+                    scroll_pos = std::cmp::min(
+                        scroll_pos + SCROLL_LINES,
+                        all_lines.len().saturating_sub(visible_h),
+                    );
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(e) => bail!("Pager input error: {e}"),
+        }
+    };
+
+    execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+    stdout.flush()?;
+    result
+}
+
+fn run_text_pager(lines: &[String]) -> Result<()> {
+    use crossterm::cursor;
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
+    use crossterm::execute;
+    use crossterm::terminal::{self, Clear, ClearType};
+    use std::io::Write as _;
+
+    if lines.is_empty() {
+        return Ok(());
+    }
+
+    terminal::enable_raw_mode()?;
+    execute!(std::io::stdout(), event::EnableMouseCapture)?;
+    struct PagerGuard;
+    impl Drop for PagerGuard {
+        fn drop(&mut self) {
+            let _ = terminal::disable_raw_mode();
+            let _ = execute!(std::io::stdout(), event::DisableMouseCapture);
+        }
+    }
+    let _guard = PagerGuard;
+    let mut stdout = std::io::stdout();
+
+    let (_, term_height) = terminal::size()?;
+    let visible_h = term_height.saturating_sub(1) as usize;
+
+    let mut scroll_pos: usize = if lines.len() > visible_h {
+        lines.len() - visible_h
+    } else {
+        0
+    };
+
+    let mut search_mode = false;
+    let mut search_query = String::new();
+    let mut search_matches: Vec<usize> = Vec::new();
+    let mut search_current: usize = 0;
+
+    let result: Result<()> = loop {
+        let (term_width, term_height) = terminal::size()?;
+        let visible_h = term_height.saturating_sub(1) as usize;
+
+        if lines.len() > visible_h && scroll_pos + visible_h > lines.len() {
+            scroll_pos = lines.len() - visible_h;
+        } else if lines.len() <= visible_h {
+            scroll_pos = 0;
+        }
+
+        let end = std::cmp::min(scroll_pos + visible_h, lines.len());
+
+        execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+        for (rel_idx, line) in lines[scroll_pos..end].iter().enumerate() {
+            let abs_idx = scroll_pos + rel_idx;
+            let display = truncate_ansi(line, term_width as usize);
+            if !search_matches.is_empty()
+                && search_current < search_matches.len()
+                && abs_idx == search_matches[search_current]
+            {
+                write!(stdout, "\x1b[7m{}\x1b[0m\r\n", display)?;
+            } else {
+                write!(stdout, "{}\r\n", display)?;
+            }
+        }
+
+        let total_lines = lines.len();
+        let status = if search_mode {
+            format!("\x1b[7m /{} \x1b[0m", search_query)
+        } else if !search_matches.is_empty() {
+            format!(
+                "\x1b[7m L{}-{}/{} | match {}/{} | n/N \x1b[0m",
+                scroll_pos + 1, end, total_lines,
+                search_current + 1, search_matches.len(),
+            )
+        } else {
+            format!(
+                "\x1b[7m L{}-{}/{} | ↑↓ PgUp PgDn Ctrl+U/D / q \x1b[0m",
+                scroll_pos + 1, end, total_lines,
+            )
+        };
+        let truncated: String = status.chars().take(term_width as usize).collect();
+        write!(stdout, "\x1b[{};1H{}", term_height, truncated)?;
+        stdout.flush()?;
+
+        match event::read() {
+            Ok(Event::Key(key)) => {
+                if search_mode {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char(c), _) if !c.is_control() => {
+                            search_query.push(c);
+                        }
+                        (KeyCode::Backspace, _) => {
+                            search_query.pop();
+                        }
+                        (KeyCode::Enter, _) => {
+                            search_matches.clear();
+                            search_current = 0;
+                            if !search_query.is_empty() {
+                                let lower = search_query.to_lowercase();
+                                for (i, line) in lines.iter().enumerate() {
+                                    let plain = render::strip_ansi(line);
+                                    if plain.to_lowercase().contains(&lower) {
+                                        search_matches.push(i);
+                                    }
+                                }
+                                if !search_matches.is_empty() {
+                                    search_current = 0;
+                                    scroll_pos = search_matches[0];
+                                    if scroll_pos + visible_h > lines.len() {
+                                        scroll_pos = lines.len().saturating_sub(visible_h);
+                                    }
+                                }
+                            }
+                            search_mode = false;
+                        }
+                        (KeyCode::Esc, _) => {
+                            search_mode = false;
+                            search_query.clear();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) if scroll_pos > 0 => {
+                            scroll_pos -= 1;
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _)
+                            if scroll_pos + visible_h < lines.len() =>
+                        {
+                            scroll_pos += 1;
+                        }
+                        (KeyCode::PageUp, _) => {
+                            scroll_pos = scroll_pos.saturating_sub(visible_h);
+                        }
+                        (KeyCode::PageDown, _) => {
+                            scroll_pos = std::cmp::min(
+                                scroll_pos + visible_h,
+                                lines.len().saturating_sub(visible_h),
+                            );
+                        }
+                        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                            let half = (visible_h / 2).max(1);
+                            scroll_pos = scroll_pos.saturating_sub(half);
+                        }
+                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                            let half = (visible_h / 2).max(1);
+                            scroll_pos = std::cmp::min(
+                                scroll_pos + half,
+                                lines.len().saturating_sub(visible_h),
+                            );
+                        }
+                        (KeyCode::Char('/'), _) => {
+                            search_mode = true;
+                            search_query.clear();
+                        }
+                        (KeyCode::Char('n'), _) if !search_matches.is_empty() => {
+                            search_current = (search_current + 1) % search_matches.len();
+                            scroll_pos = search_matches[search_current];
+                        }
+                        (KeyCode::Char('N'), _) if !search_matches.is_empty() => {
+                            search_current = if search_current == 0 {
+                                search_matches.len() - 1
+                            } else {
+                                search_current - 1
+                            };
+                            scroll_pos = search_matches[search_current];
+                        }
+                        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => break Ok(()),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Resize(_, _)) => {}
+            Ok(Event::Mouse(me)) => match me.kind {
+                MouseEventKind::ScrollUp if scroll_pos > 0 => {
+                    scroll_pos = scroll_pos.saturating_sub(SCROLL_LINES);
+                }
+                MouseEventKind::ScrollDown if scroll_pos + visible_h < lines.len() => {
+                    scroll_pos = std::cmp::min(
+                        scroll_pos + SCROLL_LINES,
+                        lines.len().saturating_sub(visible_h),
+                    );
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(e) => bail!("Pager input error: {e}"),
+        }
+    };
+
+    execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+    stdout.flush()?;
+    result
 }
 
 fn cmd_top(conn: &rusqlite::Connection, limit: i64, by: &str, json: bool) -> Result<()> {
