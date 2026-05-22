@@ -1,6 +1,7 @@
 mod db;
 mod meta;
 mod models;
+mod pager;
 mod render;
 
 use anyhow::{bail, Context, Result};
@@ -13,9 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set to true when we intentionally exit after subprocess completion
 static SUBPROCESS_EXIT: AtomicBool = AtomicBool::new(false);
-
-/// Number of lines scrolled per mouse wheel event (industry standard: 3 lines)
-const SCROLL_LINES: usize = 3;
 
 #[derive(Parser)]
 #[command(name = "ocs", version, about = "OpenCode session viewer - browse opencode sessions directly from SQLite")]
@@ -67,6 +65,14 @@ enum Commands {
         /// Only show sessions submitted from the command line (exclude search results, community questions, etc.)
         #[arg(long)]
         cli_only: bool,
+
+        /// Show all sessions, including subagent background sessions
+        #[arg(long)]
+        all: bool,
+
+        /// Minimum number of messages (filter out empty/failed sessions)
+        #[arg(long)]
+        min_msgs: Option<i64>,
     },
 
     /// Show a session's messages
@@ -322,8 +328,8 @@ fn main() -> Result<()> {
     let conn = db::open_db(None)?;
 
     match cli.command {
-        Commands::List { limit, search, since, until, project, compact, interactive, json, annotated, cli_only } => {
-            cmd_list(&conn, limit, search.as_deref(), since.as_deref(), until.as_deref(), project.as_deref(), compact, interactive, json, annotated, cli_only)
+        Commands::List { limit, search, since, until, project, compact, interactive, json, annotated, cli_only, all, min_msgs } => {
+            cmd_list(&conn, limit, search.as_deref(), since.as_deref(), until.as_deref(), project.as_deref(), compact, interactive, json, annotated, cli_only, all, min_msgs)
         }
         Commands::Show { id, raw, no_tool, sanitize } => {
             cmd_show(&conn, &id, raw, !no_tool, sanitize)
@@ -388,6 +394,8 @@ fn cmd_list(
     json: bool,
     annotated: bool,
     cli_only: bool,
+    show_all: bool,
+    min_msgs: Option<i64>,
 ) -> Result<()> {
     let since_ts = since.and_then(parse_date);
     let until_ts = until.and_then(parse_date);
@@ -400,7 +408,7 @@ fn cmd_list(
             db::list_sessions_by_ids(conn, &annotated_ids)?
         }
     } else {
-        db::list_sessions(conn, limit, search, since_ts, until_ts, project, None, cli_only)?
+        db::list_sessions(conn, limit, search, since_ts, until_ts, project, min_msgs, cli_only, show_all)?
     };
 
     if sessions.is_empty() {
@@ -547,9 +555,8 @@ fn cmd_show(conn: &rusqlite::Connection, id: &str, raw: bool, show_tools: bool, 
     if let Some(ref n) = note {
         println!("📝 *Annotation*: {}\n{}\n", n, "-".repeat(60));
     }
-    let styled = render::apply_terminal_styles(&output);
-    let highlighted = render::highlight_code_blocks(&styled);
-    println!("{highlighted}");
+    let rendered = render::render_markdown(&output);
+    println!("{rendered}");
     Ok(())
 }
 
@@ -679,7 +686,7 @@ fn cmd_run(conn: &rusqlite::Connection, message: Option<&str>, session: Option<&
             s.to_string()
         }
         None if interactive => {
-            let sessions = db::list_sessions(conn, 50, None, None, None, None, None, false)?;
+            let sessions = db::list_sessions(conn, 50, None, None, None, None, None, false, true)?;
             if sessions.is_empty() {
                 bail!("No sessions found.");
             }
@@ -789,21 +796,30 @@ fn cmd_run(conn: &rusqlite::Connection, message: Option<&str>, session: Option<&
 
         let raw_str = String::from_utf8_lossy(&output);
         let cleaned = render::strip_ansi(&raw_str);
-        let styled = render::apply_terminal_styles(&cleaned);
-        let highlighted = render::highlight_code_blocks(&styled);
+        let rendered = if cleaned.len() > 1_000_000 {
+            let cutoff = cleaned[..1_000_000].rfind('\n').unwrap_or(1_000_000);
+            let mut r = render::render_markdown(&cleaned[..cutoff]);
+            r.push_str(&format!(
+                "\n\x1b[2m... (output truncated at ~{}KB for rendering speed)\x1b[0m\n",
+                cutoff / 1024,
+            ));
+            r
+        } else {
+            render::render_markdown(&cleaned)
+        };
         let (_, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
         let visible_h = term_height.saturating_sub(1) as usize;
-        let lines: Vec<&str> = highlighted.lines().collect();
+        let lines: Vec<&str> = rendered.lines().collect();
 
         if lines.is_empty() || lines.len() <= visible_h {
-            print!("{highlighted}");
+            print!("{rendered}");
         } else {
             let owned: Vec<String> = lines.into_iter().map(|l| l.to_string()).collect();
             run_text_pager(&owned)?;
         }
 
         if first_run && current_sid.is_empty() {
-            let recent = db::list_sessions(conn, 1, None, None, None, None, None, false)
+            let recent = db::list_sessions(conn, 1, None, None, None, None, None, false, true)
                 .unwrap_or_default();
             if let Some(s) = recent.first() {
                 current_sid = s.id.clone();
@@ -869,10 +885,10 @@ fn redraw_input(stdout: &mut std::io::Stdout, buffer: &str) -> std::io::Result<(
 fn read_editor_input() -> Result<String> {
     let editor = std::env::var("EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
-        .unwrap_or_else(|_| "nvim".to_string());
+        .unwrap_or_else(|_| "vi".to_string());
     let tmp = format!("/tmp/ocs_prompt_{}.md", std::process::id());
     std::fs::write(&tmp, "")?;
-    let status = Command::new(&editor)
+    let status = std::process::Command::new(&editor)
         .arg(&tmp)
         .status()
         .with_context(|| format!("Failed to launch editor '{editor}'"))?;
@@ -938,40 +954,6 @@ fn read_multiline_input() -> Result<String> {
     result
 }
 
-fn truncate_ansi(line: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let mut visible = 0usize;
-    let mut escaped = false;
-    let mut result = String::with_capacity(line.len());
-    for c in line.chars() {
-        if escaped {
-            result.push(c);
-            if c == 'm' {
-                escaped = false;
-            }
-            continue;
-        }
-        if c == '\x1b' {
-            escaped = true;
-            result.push(c);
-            continue;
-        }
-        if visible >= max_width {
-            // Still in ANSI escape? keep going until 'm'
-            continue;
-        }
-        visible += 1;
-        result.push(c);
-    }
-    // Close any unterminated ANSI at truncation boundary
-    if escaped {
-        result.push('m');
-    }
-    result
-}
-
 fn pager_load_batch_at(
     conn: &rusqlite::Connection,
     session_id: &str,
@@ -983,15 +965,9 @@ fn pager_load_batch_at(
 ) -> Result<usize> {
     let msgs = db::get_messages_with_parts_range(conn, session_id, offset, count)?;
     let before = all_lines.len();
-    let mut batch: Vec<String> = Vec::new();
-    for msg in &msgs {
-        let text = render::render_message_batch(&[msg.clone()], show_tools);
-        let styled = render::apply_terminal_styles(&text);
-        let highlighted = render::highlight_code_blocks(&styled);
-        for line in highlighted.lines() {
-            batch.push(line.to_string());
-        }
-    }
+    let markdown = render::render_message_batch(&msgs, show_tools);
+    let rendered = render::render_markdown(&markdown);
+    let mut batch: Vec<String> = rendered.lines().map(|l| l.to_string()).collect();
     // Splice at insert_pos (chronological order)
     let mut tail = all_lines.split_off(insert_pos);
     all_lines.append(&mut batch);
@@ -1000,29 +976,54 @@ fn pager_load_batch_at(
     Ok(added)
 }
 
+struct SessionLoader {
+    sess_id: String,
+    show_tools: bool,
+    load_offset: i64,
+}
+
+impl pager::Loader for SessionLoader {
+    fn load_more(&mut self) -> Vec<String> {
+        if self.load_offset <= 0 {
+            return vec![];
+        }
+        let conn = match db::open_db(None) {
+            Ok(c) => c,
+            Err(_) => {
+                self.load_offset = 0;
+                return vec![];
+            }
+        };
+        let count = std::cmp::min(50i64, self.load_offset);
+        let new_offset = self.load_offset - count;
+        let msgs = match db::get_messages_with_parts_range(&conn, &self.sess_id, new_offset, count) {
+            Ok(m) => m,
+            Err(_) => {
+                self.load_offset = 0;
+                return vec![];
+            }
+        };
+        let markdown = render::render_message_batch(&msgs, self.show_tools);
+        let rendered = render::render_markdown(&markdown);
+        let lines: Vec<String> = rendered.lines().map(|l| l.to_string()).collect();
+        self.load_offset = new_offset;
+        lines
+    }
+}
+
 fn interactive_pager(
     conn: &rusqlite::Connection,
     session: &models::Session,
     show_tools: bool,
     note: Option<String>,
 ) -> Result<()> {
-    use crossterm::cursor;
-    use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
-    use crossterm::execute;
-    use crossterm::terminal::{self, Clear, ClearType};
-    use std::io::Write as _;
-
-    const BATCH_SIZE: i64 = 50;
-    const LOAD_THRESHOLD: usize = 5;
-
     let total_msgs = db::get_message_count(conn, &session.id)?;
     let mut all_lines: Vec<String> = Vec::new();
     let header_count: usize;
 
-    // Render header + note with terminal styles (no code highlighting)
     {
         let header_str = render::render_session_header(session);
-        let styled_header = render::apply_terminal_styles(&header_str);
+        let styled_header = render::render_markdown(&header_str);
         for line in styled_header.lines() {
             all_lines.push(line.to_string());
         }
@@ -1035,448 +1036,44 @@ fn interactive_pager(
         header_count = all_lines.len();
     }
 
-    terminal::enable_raw_mode()?;
-    execute!(std::io::stdout(), event::EnableMouseCapture)?;
-    struct PagerGuard;
-    impl Drop for PagerGuard {
-        fn drop(&mut self) {
-            let _ = terminal::disable_raw_mode();
-            let _ = execute!(std::io::stdout(), event::DisableMouseCapture);
-        }
-    }
-    let _guard = PagerGuard;
-    let mut stdout = std::io::stdout();
-
-    // Load initial batch from the END (most recent messages first)
-    let mut load_offset: i64 = if total_msgs > 0 {
-        let batch = std::cmp::min(BATCH_SIZE, total_msgs);
-        total_msgs - batch
-    } else {
-        0
-    };
-    if total_msgs > 0 {
-        let count = total_msgs - load_offset;
-        let _ = pager_load_batch_at(
-            conn, &session.id, show_tools, load_offset, count,
+    let mut load_offset = total_msgs;
+    const BATCH_SIZE: i64 = 50;
+    const INITIAL_BATCHES: i64 = 4;
+    let mut batches_loaded = 0i64;
+    while load_offset > 0 && batches_loaded < INITIAL_BATCHES {
+        let count = std::cmp::min(BATCH_SIZE, load_offset);
+        let new_offset = load_offset - count;
+        if let Ok(_added) = pager_load_batch_at(
+            conn, &session.id, show_tools, new_offset, count,
             &mut all_lines, header_count,
-        );
+        ) {
+            load_offset = new_offset;
+            batches_loaded += 1;
+        } else {
+            break;
+        }
     }
 
-    // Start at bottom so most recent content is visible first
-    let mut scroll_pos: usize = {
-        if let Ok((_, term_height)) = terminal::size() {
-            let visible_h = term_height.saturating_sub(1) as usize;
-            if all_lines.len() > visible_h {
-                all_lines.len() - visible_h
-            } else {
-                0
-            }
-        } else {
-            0
-        }
-    };
+    let prefix = format!("{} | msgs:{}/{} | ", session.id, total_msgs, total_msgs);
+    let mut p = pager::Pager::new(all_lines).with_status_prefix(&prefix);
 
-    // Search state
-    let mut search_mode = false;
-    let mut search_query = String::new();
-    let mut search_matches: Vec<usize> = Vec::new();
-    let mut search_current: usize = 0;
+    if load_offset > 0 {
+        p.set_loader(header_count, Box::new(SessionLoader {
+            sess_id: session.id.clone(),
+            show_tools,
+            load_offset,
+        }));
+    }
 
-    let result: Result<()> = loop {
-        // Auto-load earlier batches when scrolling near the top of loaded content
-        if scroll_pos <= header_count + LOAD_THRESHOLD && load_offset > 0 {
-            let count = std::cmp::min(BATCH_SIZE, load_offset);
-            let new_offset = load_offset - count;
-            if let Ok(added) = pager_load_batch_at(
-                conn, &session.id, show_tools, new_offset, count,
-                &mut all_lines, header_count,
-            ) {
-                scroll_pos += added;
-                load_offset = new_offset;
-            }
-        }
-
-        let (term_width, term_height) = terminal::size()?;
-        let visible_h = term_height.saturating_sub(1) as usize;
-
-        if all_lines.len() > visible_h && scroll_pos + visible_h > all_lines.len() {
-            scroll_pos = all_lines.len() - visible_h;
-        } else if all_lines.len() <= visible_h {
-            scroll_pos = 0;
-        }
-
-        let end = scroll_pos + visible_h;
-        let end = std::cmp::min(end, all_lines.len());
-
-        execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-        for (rel_idx, line) in all_lines[scroll_pos..end].iter().enumerate() {
-            let abs_idx = scroll_pos + rel_idx;
-            let display = truncate_ansi(line, term_width as usize);
-            if !search_matches.is_empty()
-                && search_current < search_matches.len()
-                && abs_idx == search_matches[search_current]
-            {
-                write!(stdout, "\x1b[7m{}\x1b[0m\r\n", display)?;
-            } else {
-                write!(stdout, "{}\r\n", display)?;
-            }
-        }
-
-        let loaded_count = total_msgs - load_offset;
-        let status = if search_mode {
-            format!("\x1b[7m /{} \x1b[0m", search_query)
-        } else if !search_matches.is_empty() {
-            format!(
-                "\x1b[7m {} | msgs:{}/{} | L{}-{}/{} | match {}/{} | n/N \x1b[0m",
-                session.id, loaded_count, total_msgs,
-                scroll_pos + 1, end, all_lines.len(),
-                search_current + 1, search_matches.len(),
-            )
-        } else {
-            format!(
-                "\x1b[7m {} | msgs:{}/{} | L{}-{}/{} | ↑↓ PgUp PgDn Ctrl+U/D g G / q \x1b[0m",
-                session.id, loaded_count, total_msgs,
-                scroll_pos + 1, end, all_lines.len(),
-            )
-        };
-        let truncated: String = status.chars().take(term_width as usize).collect();
-        write!(stdout, "\x1b[{};1H{}", term_height, truncated)?;
-        stdout.flush()?;
-
-        match event::read() {
-            Ok(Event::Key(key)) => {
-                if search_mode {
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Char(c), _) if !c.is_control() => {
-                            search_query.push(c);
-                        }
-                        (KeyCode::Backspace, _) => {
-                            search_query.pop();
-                        }
-                        (KeyCode::Enter, _) => {
-                            search_matches.clear();
-                            search_current = 0;
-                            if !search_query.is_empty() {
-                                let lower = search_query.to_lowercase();
-                                for (i, line) in all_lines.iter().enumerate() {
-                                    let plain = render::strip_ansi(line);
-                                    if plain.to_lowercase().contains(&lower) {
-                                        search_matches.push(i);
-                                    }
-                                }
-                                if !search_matches.is_empty() {
-                                    search_current = 0;
-                                    scroll_pos = search_matches[0];
-                                    if scroll_pos + visible_h > all_lines.len() {
-                                        scroll_pos = all_lines.len().saturating_sub(visible_h);
-                                    }
-                                }
-                            }
-                            search_mode = false;
-                        }
-                        (KeyCode::Esc, _) => {
-                            search_mode = false;
-                            search_query.clear();
-                        }
-                        _ => {}
-                    }
-                } else {
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) if scroll_pos > 0 => {
-                            scroll_pos -= 1;
-                        }
-                        (KeyCode::Down, _) | (KeyCode::Char('j'), _)
-                            if scroll_pos + visible_h < all_lines.len() =>
-                        {
-                            scroll_pos += 1;
-                        }
-                        (KeyCode::PageUp, _) => {
-                            scroll_pos = scroll_pos.saturating_sub(visible_h);
-                        }
-                        (KeyCode::PageDown, _) => {
-                            scroll_pos = std::cmp::min(
-                                scroll_pos + visible_h,
-                                all_lines.len().saturating_sub(visible_h),
-                            );
-                        }
-                        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                            let half = (visible_h / 2).max(1);
-                            scroll_pos = scroll_pos.saturating_sub(half);
-                        }
-                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                            let half = (visible_h / 2).max(1);
-                            scroll_pos = std::cmp::min(
-                                scroll_pos + half,
-                                all_lines.len().saturating_sub(visible_h),
-                            );
-                        }
-                        (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
-                            while load_offset > 0 {
-                                let count = std::cmp::min(BATCH_SIZE, load_offset);
-                                let new_offset = load_offset - count;
-                                if pager_load_batch_at(
-                                    conn, &session.id, show_tools, new_offset, count,
-                                    &mut all_lines, header_count,
-                                ).is_ok() {
-                                    load_offset = new_offset;
-                                } else {
-                                    break;
-                                }
-                            }
-                            scroll_pos = 0;
-                        }
-                        (KeyCode::End, _) | (KeyCode::Char('G'), _) => {
-                            while load_offset > 0 {
-                                let count = std::cmp::min(BATCH_SIZE, load_offset);
-                                let new_offset = load_offset - count;
-                                if pager_load_batch_at(
-                                    conn, &session.id, show_tools, new_offset, count,
-                                    &mut all_lines, header_count,
-                                ).is_ok() {
-                                    load_offset = new_offset;
-                                } else {
-                                    break;
-                                }
-                            }
-                            scroll_pos = all_lines.len().saturating_sub(visible_h);
-                        }
-                        (KeyCode::Char('/'), _) => {
-                            search_mode = true;
-                            search_query.clear();
-                        }
-                        (KeyCode::Char('n'), _) if !search_matches.is_empty() => {
-                            search_current = (search_current + 1) % search_matches.len();
-                            scroll_pos = search_matches[search_current];
-                        }
-                        (KeyCode::Char('N'), _) if !search_matches.is_empty() => {
-                            search_current = if search_current == 0 {
-                                search_matches.len() - 1
-                            } else {
-                                search_current - 1
-                            };
-                            scroll_pos = search_matches[search_current];
-                        }
-                        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => break Ok(()),
-                        _ => {}
-                    }
-                }
-            }
-            Ok(Event::Resize(_, _)) => {}
-            Ok(Event::Mouse(me)) => match me.kind {
-                MouseEventKind::ScrollUp if scroll_pos > 0 => {
-                    scroll_pos = scroll_pos.saturating_sub(SCROLL_LINES);
-                }
-                MouseEventKind::ScrollDown
-                    if scroll_pos + visible_h < all_lines.len() =>
-                {
-                    scroll_pos = std::cmp::min(
-                        scroll_pos + SCROLL_LINES,
-                        all_lines.len().saturating_sub(visible_h),
-                    );
-                }
-                _ => {}
-            },
-            Ok(_) => {}
-            Err(e) => bail!("Pager input error: {e}"),
-        }
-    };
-
-    execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-    stdout.flush()?;
-    result
+    p.run()?;
+    Ok(())
 }
 
 fn run_text_pager(lines: &[String]) -> Result<()> {
-    use crossterm::cursor;
-    use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
-    use crossterm::execute;
-    use crossterm::terminal::{self, Clear, ClearType};
-    use std::io::Write as _;
-
-    if lines.is_empty() {
-        return Ok(());
-    }
-
-    terminal::enable_raw_mode()?;
-    execute!(std::io::stdout(), event::EnableMouseCapture)?;
-    struct PagerGuard;
-    impl Drop for PagerGuard {
-        fn drop(&mut self) {
-            let _ = terminal::disable_raw_mode();
-            let _ = execute!(std::io::stdout(), event::DisableMouseCapture);
-        }
-    }
-    let _guard = PagerGuard;
-    let mut stdout = std::io::stdout();
-
-    let (_, term_height) = terminal::size()?;
-    let visible_h = term_height.saturating_sub(1) as usize;
-
-    let mut scroll_pos: usize = if lines.len() > visible_h {
-        lines.len() - visible_h
-    } else {
-        0
-    };
-
-    let mut search_mode = false;
-    let mut search_query = String::new();
-    let mut search_matches: Vec<usize> = Vec::new();
-    let mut search_current: usize = 0;
-
-    let result: Result<()> = loop {
-        let (term_width, term_height) = terminal::size()?;
-        let visible_h = term_height.saturating_sub(1) as usize;
-
-        if lines.len() > visible_h && scroll_pos + visible_h > lines.len() {
-            scroll_pos = lines.len() - visible_h;
-        } else if lines.len() <= visible_h {
-            scroll_pos = 0;
-        }
-
-        let end = std::cmp::min(scroll_pos + visible_h, lines.len());
-
-        execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-        for (rel_idx, line) in lines[scroll_pos..end].iter().enumerate() {
-            let abs_idx = scroll_pos + rel_idx;
-            let display = truncate_ansi(line, term_width as usize);
-            if !search_matches.is_empty()
-                && search_current < search_matches.len()
-                && abs_idx == search_matches[search_current]
-            {
-                write!(stdout, "\x1b[7m{}\x1b[0m\r\n", display)?;
-            } else {
-                write!(stdout, "{}\r\n", display)?;
-            }
-        }
-
-        let total_lines = lines.len();
-        let status = if search_mode {
-            format!("\x1b[7m /{} \x1b[0m", search_query)
-        } else if !search_matches.is_empty() {
-            format!(
-                "\x1b[7m L{}-{}/{} | match {}/{} | n/N \x1b[0m",
-                scroll_pos + 1, end, total_lines,
-                search_current + 1, search_matches.len(),
-            )
-        } else {
-            format!(
-                "\x1b[7m L{}-{}/{} | ↑↓ PgUp PgDn Ctrl+U/D / q \x1b[0m",
-                scroll_pos + 1, end, total_lines,
-            )
-        };
-        let truncated: String = status.chars().take(term_width as usize).collect();
-        write!(stdout, "\x1b[{};1H{}", term_height, truncated)?;
-        stdout.flush()?;
-
-        match event::read() {
-            Ok(Event::Key(key)) => {
-                if search_mode {
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Char(c), _) if !c.is_control() => {
-                            search_query.push(c);
-                        }
-                        (KeyCode::Backspace, _) => {
-                            search_query.pop();
-                        }
-                        (KeyCode::Enter, _) => {
-                            search_matches.clear();
-                            search_current = 0;
-                            if !search_query.is_empty() {
-                                let lower = search_query.to_lowercase();
-                                for (i, line) in lines.iter().enumerate() {
-                                    let plain = render::strip_ansi(line);
-                                    if plain.to_lowercase().contains(&lower) {
-                                        search_matches.push(i);
-                                    }
-                                }
-                                if !search_matches.is_empty() {
-                                    search_current = 0;
-                                    scroll_pos = search_matches[0];
-                                    if scroll_pos + visible_h > lines.len() {
-                                        scroll_pos = lines.len().saturating_sub(visible_h);
-                                    }
-                                }
-                            }
-                            search_mode = false;
-                        }
-                        (KeyCode::Esc, _) => {
-                            search_mode = false;
-                            search_query.clear();
-                        }
-                        _ => {}
-                    }
-                } else {
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) if scroll_pos > 0 => {
-                            scroll_pos -= 1;
-                        }
-                        (KeyCode::Down, _) | (KeyCode::Char('j'), _)
-                            if scroll_pos + visible_h < lines.len() =>
-                        {
-                            scroll_pos += 1;
-                        }
-                        (KeyCode::PageUp, _) => {
-                            scroll_pos = scroll_pos.saturating_sub(visible_h);
-                        }
-                        (KeyCode::PageDown, _) => {
-                            scroll_pos = std::cmp::min(
-                                scroll_pos + visible_h,
-                                lines.len().saturating_sub(visible_h),
-                            );
-                        }
-                        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                            let half = (visible_h / 2).max(1);
-                            scroll_pos = scroll_pos.saturating_sub(half);
-                        }
-                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                            let half = (visible_h / 2).max(1);
-                            scroll_pos = std::cmp::min(
-                                scroll_pos + half,
-                                lines.len().saturating_sub(visible_h),
-                            );
-                        }
-                        (KeyCode::Char('/'), _) => {
-                            search_mode = true;
-                            search_query.clear();
-                        }
-                        (KeyCode::Char('n'), _) if !search_matches.is_empty() => {
-                            search_current = (search_current + 1) % search_matches.len();
-                            scroll_pos = search_matches[search_current];
-                        }
-                        (KeyCode::Char('N'), _) if !search_matches.is_empty() => {
-                            search_current = if search_current == 0 {
-                                search_matches.len() - 1
-                            } else {
-                                search_current - 1
-                            };
-                            scroll_pos = search_matches[search_current];
-                        }
-                        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => break Ok(()),
-                        _ => {}
-                    }
-                }
-            }
-            Ok(Event::Resize(_, _)) => {}
-            Ok(Event::Mouse(me)) => match me.kind {
-                MouseEventKind::ScrollUp if scroll_pos > 0 => {
-                    scroll_pos = scroll_pos.saturating_sub(SCROLL_LINES);
-                }
-                MouseEventKind::ScrollDown if scroll_pos + visible_h < lines.len() => {
-                    scroll_pos = std::cmp::min(
-                        scroll_pos + SCROLL_LINES,
-                        lines.len().saturating_sub(visible_h),
-                    );
-                }
-                _ => {}
-            },
-            Ok(_) => {}
-            Err(e) => bail!("Pager input error: {e}"),
-        }
-    };
-
-    execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-    stdout.flush()?;
-    result
+    let owned: Vec<String> = lines.to_vec();
+    let mut p = pager::Pager::new(owned);
+    p.run()?;
+    Ok(())
 }
 
 fn cmd_top(conn: &rusqlite::Connection, limit: i64, by: &str, json: bool) -> Result<()> {
@@ -1507,7 +1104,7 @@ fn cmd_watch(conn: &rusqlite::Connection, id: Option<&str>, poll_secs: u64, show
     let sid = match id {
         Some(s) => s.to_string(),
         None => {
-            let sessions = db::list_sessions(conn, 1, None, None, None, None, None, false)?;
+            let sessions = db::list_sessions(conn, 1, None, None, None, None, None, false, true)?;
             let s = sessions.first()
                 .cloned()
                 .with_context(|| "No sessions found.")?;
