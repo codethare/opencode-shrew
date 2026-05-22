@@ -16,6 +16,9 @@ pub struct Session {
     pub msg_count: i64,
     #[serde(default)]
     pub total_cost: f64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

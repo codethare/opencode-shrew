@@ -39,11 +39,13 @@ pub fn list_sessions(
     project: Option<&str>,
     min_msgs: Option<i64>,
     cli_only: bool,
+    show_all: bool,
 ) -> Result<Vec<Session>> {
     let mut sql = String::from(
         "SELECT s.id, s.project_id, s.slug, s.directory, s.title, \
                 s.time_created, s.time_updated, \
                 s.summary_additions, s.summary_deletions, s.summary_files, \
+                s.parent_id, \
                 (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msg_count, \
                 (SELECT json_extract(m.data, '$.model.modelID') FROM message m \
                  WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model, \
@@ -93,6 +95,10 @@ pub fn list_sessions(
         params.push(Box::new(min));
     }
 
+    if !show_all {
+        conditions.push("s.parent_id IS NULL".to_string());
+    }
+
     if cli_only {
         conditions.push("s.permission IS NULL".to_string());
     }
@@ -127,6 +133,7 @@ pub fn list_sessions(
             msg_count: row.get("msg_count")?,
             model: row.get("model")?,
             total_cost: row.get("total_cost")?,
+            parent_id: row.get("parent_id")?,
         })
     })?;
 
@@ -157,7 +164,8 @@ pub fn list_sessions_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Ses
                 (SELECT json_extract(m.data, '$.model.modelID') FROM message m \
                  WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model, \
                 COALESCE((SELECT SUM(json_extract(m.data, '$.cost')) FROM message m \
-                 WHERE m.session_id = s.id AND json_extract(m.data, '$.cost') IS NOT NULL), 0.0) AS total_cost \
+                 WHERE m.session_id = s.id AND json_extract(m.data, '$.cost') IS NOT NULL), 0.0) AS total_cost, \
+                 s.parent_id \
          FROM session s WHERE s.id IN ({}) \
          ORDER BY s.time_created DESC",
         placeholders.join(",")
@@ -182,6 +190,7 @@ pub fn list_sessions_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Ses
             msg_count: row.get("msg_count")?,
             model: row.get("model")?,
             total_cost: row.get("total_cost")?,
+            parent_id: row.get("parent_id")?,
         })
     })?;
     let mut sessions = Vec::new();
@@ -195,6 +204,7 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
     let sql = "SELECT s.id, s.project_id, s.slug, s.directory, s.title, \
                s.time_created, s.time_updated, \
                s.summary_additions, s.summary_deletions, s.summary_files, \
+               s.parent_id, \
                (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msg_count, \
                (SELECT json_extract(m.data, '$.model.modelID') FROM message m \
                 WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model, \
@@ -217,6 +227,7 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
             msg_count: row.get("msg_count")?,
             model: row.get("model")?,
             total_cost: row.get("total_cost")?,
+            parent_id: row.get("parent_id")?,
         })
     })?;
     match rows.next() {
@@ -230,6 +241,7 @@ pub fn get_related_sessions(conn: &Connection, id: &str, directory: &str, limit:
     let sql = "SELECT s.id, s.project_id, s.slug, s.directory, s.title, \
                s.time_created, s.time_updated, \
                s.summary_additions, s.summary_deletions, s.summary_files, \
+               s.parent_id, \
                (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msg_count, \
                (SELECT json_extract(m.data, '$.model.modelID') FROM message m \
                 WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model, \
@@ -253,6 +265,7 @@ pub fn get_related_sessions(conn: &Connection, id: &str, directory: &str, limit:
             msg_count: row.get("msg_count")?,
             model: row.get("model")?,
             total_cost: row.get("total_cost")?,
+            parent_id: row.get("parent_id")?,
         })
     })?;
     let mut sessions = Vec::new();
@@ -633,15 +646,16 @@ pub fn list_old_sessions(conn: &Connection, days: i64, limit: i64) -> Result<Vec
         SELECT s.id, s.project_id, s.slug, s.directory, s.title, \
                s.time_created, s.time_updated, \
                s.summary_additions, s.summary_deletions, s.summary_files, \
+               s.parent_id, \
                (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msg_count, \
                (SELECT json_extract(m.data, '$.model.modelID') FROM message m \
                 WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model, \
                COALESCE((SELECT SUM(json_extract(m.data, '$.cost')) FROM message m \
                 WHERE m.session_id = s.id AND json_extract(m.data, '$.cost') IS NOT NULL), 0.0) AS total_cost \
-        FROM session s \
-        WHERE s.time_created < ?1 \
-        ORDER BY s.time_created ASC \
-        LIMIT ?2";
+         FROM session s \
+         WHERE s.time_created < ?1 \
+         ORDER BY s.time_created ASC \
+         LIMIT ?2";
 
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(rusqlite::params![cutoff_ms, limit], |row| {
@@ -659,6 +673,7 @@ pub fn list_old_sessions(conn: &Connection, days: i64, limit: i64) -> Result<Vec
             msg_count: row.get("msg_count")?,
             model: row.get("model")?,
             total_cost: row.get("total_cost")?,
+            parent_id: row.get("parent_id")?,
         })
     })?;
     let mut sessions = Vec::new();
