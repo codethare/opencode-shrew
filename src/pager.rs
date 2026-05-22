@@ -13,6 +13,8 @@ pub struct Pager {
     search_query: String,
     search_matches: Vec<usize>,
     search_current: usize,
+    goto_mode: bool,
+    goto_buf: String,
     status_prefix: String,
     loader: Option<Box<dyn Loader>>,
     loader_header: usize,
@@ -30,6 +32,8 @@ impl Pager {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_current: 0,
+            goto_mode: false,
+            goto_buf: String::new(),
             status_prefix: String::new(),
             loader: None,
             loader_header: 0,
@@ -100,6 +104,7 @@ impl Pager {
             let end = std::cmp::min(self.scroll_pos + visible_h, self.lines.len());
 
             execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+            let match_set: std::collections::HashSet<usize> = self.search_matches.iter().copied().collect();
             for (rel_idx, line) in self.lines[self.scroll_pos..end].iter().enumerate() {
                 let abs_idx = self.scroll_pos + rel_idx;
                 let display = truncate_ansi(line, term_width as usize);
@@ -108,28 +113,34 @@ impl Pager {
                     && abs_idx == self.search_matches[self.search_current]
                 {
                     write!(stdout, "\x1b[7m{}\x1b[0m\r\n", display)?;
+                } else if match_set.contains(&abs_idx) {
+                    write!(stdout, "\x1b[48;5;236m{}\x1b[0m\r\n", display)?;
                 } else {
                     write!(stdout, "{}\r\n", display)?;
                 }
             }
 
             let total = self.lines.len();
-            let status = if self.search_mode {
+            let pct = if total <= 1 { 100 } else { ((end as f64 / total as f64) * 100.0) as usize };
+            let status = if self.goto_mode {
+                format!("\x1b[7m :{} \x1b[0m", self.goto_buf)
+            } else if self.search_mode {
                 format!("\x1b[7m /{} \x1b[0m", self.search_query)
             } else if !self.search_matches.is_empty() {
                 format!(
-                    "\x1b[7m {}L{}-{}/{} | match {}/{} | n/N \x1b[0m",
+                    "\x1b[7m {}L{}-{}/{} ({}%) | match {}/{} | n/N \x1b[0m",
                     self.status_prefix,
                     self.scroll_pos + 1,
                     end,
                     total,
+                    pct,
                     self.search_current + 1,
                     self.search_matches.len(),
                 )
             } else {
                 format!(
-                    "\x1b[7m {}L{}-{}/{} | ↑↓ PgUp PgDn Ctrl+U/D g G / q \x1b[0m",
-                    self.status_prefix, self.scroll_pos + 1, end, total,
+                    "\x1b[7m {}L{}-{}/{} ({}%) | ↑↓ PgUp PgDn Ctrl+U/D g G / q \x1b[0m",
+                    self.status_prefix, self.scroll_pos + 1, end, total, pct,
                 )
             };
             let truncated: String = status.chars().take(term_width as usize).collect();
@@ -138,7 +149,9 @@ impl Pager {
 
             match event::read() {
                 Ok(Event::Key(key)) => {
-                    if self.search_mode {
+                    if self.goto_mode {
+                        self.handle_goto_key(key);
+                    } else if self.search_mode {
                         self.handle_search_key(key);
                     } else {
                         if self.handle_normal_key(key, visible_h)? {
@@ -211,6 +224,33 @@ impl Pager {
         }
     }
 
+    fn handle_goto_key(&mut self, key: crossterm::event::KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char(c), _) if c.is_ascii_digit() => {
+                self.goto_buf.push(c);
+            }
+            (KeyCode::Backspace, _) => {
+                self.goto_buf.pop();
+            }
+            (KeyCode::Enter, _) => {
+                if let Ok(line_num) = self.goto_buf.parse::<usize>() {
+                    if line_num > 0 {
+                        let target = line_num.saturating_sub(1);
+                        let max_pos = self.lines.len().saturating_sub(1);
+                        self.scroll_pos = target.min(max_pos);
+                    }
+                }
+                self.goto_mode = false;
+                self.goto_buf.clear();
+            }
+            (KeyCode::Esc, _) => {
+                self.goto_mode = false;
+                self.goto_buf.clear();
+            }
+            _ => {}
+        }
+    }
+
     fn handle_normal_key(
         &mut self,
         key: crossterm::event::KeyEvent,
@@ -250,6 +290,10 @@ impl Pager {
             }
             (KeyCode::End, _) | (KeyCode::Char('G'), _) => {
                 self.scroll_pos = self.lines.len().saturating_sub(visible_h);
+            }
+            (KeyCode::Char(':'), _) => {
+                self.goto_mode = true;
+                self.goto_buf.clear();
             }
             (KeyCode::Char('/'), _) => {
                 self.search_mode = true;
