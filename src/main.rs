@@ -43,7 +43,7 @@ enum Commands {
         until: Option<String>,
 
         /// Filter by project directory (partial path match)
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         project: Option<String>,
 
         /// Compact one-line format
@@ -247,7 +247,7 @@ enum Commands {
         until: Option<String>,
 
         /// Filter by project directory
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         project: Option<String>,
 
         /// Output format: markdown or json
