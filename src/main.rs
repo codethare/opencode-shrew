@@ -316,6 +316,17 @@ enum Commands {
         search: Option<String>,
     },
 
+    /// Undo a message in a session (interactive: select session + message, then [d]elete or [e]dit)
+    Undo {
+        /// Use the most recent session
+        #[arg(short = 'c', long = "continue")]
+        continue_flag: bool,
+
+        /// Session ID
+        #[arg(short, long)]
+        session: Option<String>,
+    },
+
     /// Generate shell completion scripts
     Completion {
         /// Shell type: bash, zsh, fish, powershell, elvish
@@ -375,6 +386,9 @@ fn main() -> Result<()> {
         }
         Commands::Tag { id, tag, remove, list, search } => {
             cmd_tag(&conn, id.as_deref(), tag.as_deref(), remove, list, search.as_deref())
+        }
+        Commands::Undo { session, continue_flag } => {
+            cmd_undo(&conn, session.as_deref(), continue_flag)
         }
         Commands::Completion { shell } => {
             cmd_completion(&shell)
@@ -1403,6 +1417,161 @@ fn cmd_completion(shell: &str) -> Result<()> {
     let name = cmd.get_name().to_string();
     generate(shell, &mut cmd, name, &mut std::io::stdout());
     Ok(())
+}
+
+fn cmd_undo(conn: &rusqlite::Connection, session: Option<&str>, cont: bool) -> Result<()> {
+    let sid = match session {
+        Some(s) => {
+            validate_session_id(s)?;
+            s.to_string()
+        }
+        None if cont => {
+            let sessions = db::list_sessions(conn, 1, None, None, None, None, None, false, true)?;
+            sessions.first()
+                .cloned()
+                .with_context(|| "No sessions found.")?
+                .id
+        }
+        None => {
+            let sessions = db::list_sessions(conn, 50, None, None, None, None, None, false, true)?;
+            if sessions.is_empty() {
+                bail!("No sessions found.");
+            }
+            pick_session_interactive(conn, &sessions)?
+        }
+    };
+
+    db::get_session(conn, &sid)?
+        .with_context(|| format!("Session not found: {sid}"))?;
+
+    let messages = db::get_messages(conn, &sid)?;
+    let user_messages: Vec<&models::Message> = messages.iter()
+        .filter(|m| m.data.role == "user")
+        .collect();
+
+    if user_messages.is_empty() {
+        bail!("No user messages found in session {sid}.");
+    }
+
+    let msg_ids: Vec<String> = user_messages.iter().map(|m| m.id.clone()).collect();
+    let parts_map = db::get_parts_batch(conn, &msg_ids)?;
+
+    let selected_id = pick_message_interactive(&user_messages, &parts_map)?;
+
+    print!("[d]elete  [e]dit  [q]uit: ");
+    std::io::stdout().flush()?;
+    let mut action = String::new();
+    std::io::stdin().read_line(&mut action)?;
+    match action.trim().to_lowercase().as_str() {
+        "d" => {
+            let rw_conn = db::open_db_rw(None)?;
+            if db::delete_message(&rw_conn, &selected_id)? {
+                println!("Message {} deleted from {}.", selected_id, sid);
+            } else {
+                eprintln!("Failed to delete message {}.", selected_id);
+            }
+        }
+        "e" => {
+            let text = db::get_message_text(conn, &selected_id)?;
+            let new_text = edit_message_text(&text)?;
+            if new_text == text {
+                println!("No changes made.");
+            } else {
+                let rw_conn = db::open_db_rw(None)?;
+                db::update_message_text(&rw_conn, &selected_id, &new_text)?;
+                println!("Message {} updated.", selected_id);
+            }
+        }
+        _ => {
+            println!("Cancelled.");
+        }
+    }
+
+    Ok(())
+}
+
+fn pick_message_interactive<'a>(
+    messages: &[&models::Message],
+    parts_map: &std::collections::HashMap<String, Vec<models::Part>>,
+) -> Result<String> {
+    let lines: Vec<String> = messages.iter().map(|m| {
+        let ts = format_timestamp(m.time_created);
+        let preview = parts_map.get(&m.id)
+            .and_then(|parts| {
+                parts.iter()
+                    .find(|p| p.data.r#type == "text" || p.data.r#type == "reasoning")
+                    .and_then(|p| p.data.text.as_deref())
+            })
+            .unwrap_or("")
+            .chars()
+            .take(80)
+            .collect::<String>();
+        format!("{}\t{}  {}\t{}", m.id, ts, m.data.role, preview)
+    }).collect();
+
+    let selector = if which("peco").is_ok() {
+        "peco"
+    } else if which("fzf").is_ok() {
+        "fzf"
+    } else {
+        bail!("Neither peco nor fzf found. Install one for interactive selection.");
+    };
+
+    let mut child = std::process::Command::new(selector)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("Failed to spawn {selector}"))?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        for line in &lines {
+            writeln!(stdin, "{line}")?;
+        }
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!("Selection cancelled.");
+    }
+
+    let selected = String::from_utf8(output.stdout)
+        .with_context(|| "peco/fzf output contained invalid UTF-8")?;
+    selected.lines().next()
+        .and_then(|line| line.split('\t').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .with_context(|| "No message selected.")
+}
+
+fn edit_message_text(current_text: &str) -> Result<String> {
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let tmp = format!("/tmp/ocs_message_edit_{}.md", std::process::id());
+    std::fs::write(&tmp, current_text)
+        .with_context(|| "Failed to write temp file for editor")?;
+    let status = std::process::Command::new(&editor)
+        .arg(&tmp)
+        .status()
+        .with_context(|| format!("Failed to launch editor '{editor}'"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("Editor exited unsuccessfully.");
+    }
+    let content = std::fs::read_to_string(&tmp)
+        .with_context(|| "Failed to read editor output")?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(content)
+}
+
+fn format_timestamp(ts_ms: i64) -> String {
+    let secs = ts_ms / 1000;
+    let nsecs = ((ts_ms % 1000) * 1_000_000) as u32;
+    match chrono::DateTime::from_timestamp(secs, nsecs) {
+        Some(dt) => dt.format("%H:%M:%S").to_string(),
+        None => "??:??:??".to_string(),
+    }
 }
 
 /// Atomic file write: creates parent dirs, writes to .tmp, then renames

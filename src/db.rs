@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 use crate::models::*;
 
@@ -618,6 +618,65 @@ pub fn delete_session(conn: &Connection, id: &str) -> Result<bool> {
     conn.execute("DELETE FROM message WHERE session_id = ?1", rusqlite::params![id])?;
     let affected = conn.execute("DELETE FROM session WHERE id = ?1", rusqlite::params![id])?;
     Ok(affected > 0)
+}
+
+pub fn delete_message(conn: &Connection, message_id: &str) -> Result<bool> {
+    conn.execute("DELETE FROM part WHERE message_id = ?1", params![message_id])?;
+    let affected = conn.execute("DELETE FROM message WHERE id = ?1", params![message_id])?;
+    Ok(affected > 0)
+}
+
+pub fn get_message_text(conn: &Connection, message_id: &str) -> Result<String> {
+    let sql = "SELECT data FROM part WHERE message_id = ?1 ORDER BY id ASC";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![message_id], |row| {
+        let data_str: String = row.get(0)?;
+        Ok(data_str)
+    })?;
+    let mut text = String::new();
+    for row in rows {
+        let data_str = row?;
+        if let Ok(part_data) = serde_json::from_str::<PartData>(&data_str) {
+            match part_data.r#type.as_str() {
+                "text" | "reasoning" => {
+                    if let Some(t) = &part_data.text {
+                        text.push_str(t);
+                        text.push('\n');
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(text.trim().to_string())
+}
+
+pub fn update_message_text(conn: &Connection, message_id: &str, new_text: &str) -> Result<()> {
+    let sql = "SELECT id, data FROM part WHERE message_id = ?1 \
+               AND json_extract(data, '$.type') IN ('text', 'reasoning') \
+               ORDER BY id ASC LIMIT 1";
+    let mut stmt = conn.prepare(sql)?;
+    let result: std::result::Result<(String, String), rusqlite::Error> =
+        stmt.query_row(params![message_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        });
+
+    if let Ok((part_id, data_str)) = result {
+        let mut part_data: PartData = serde_json::from_str(&data_str)?;
+        part_data.text = Some(new_text.to_string());
+        let updated = serde_json::to_string(&part_data)?;
+        conn.execute(
+            "UPDATE part SET data = ?1 WHERE id = ?2",
+            params![updated, part_id],
+        )?;
+
+        conn.execute(
+            "DELETE FROM part WHERE message_id = ?1 AND id != ?2 \
+             AND json_extract(data, '$.type') IN ('text', 'reasoning')",
+            params![message_id, part_id],
+        )?;
+    }
+    Ok(())
 }
 
 /// Read session diff from storage
