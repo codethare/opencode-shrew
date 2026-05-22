@@ -185,6 +185,10 @@ enum Commands {
         /// Open $EDITOR/nvim to compose the message
         #[arg(short = 'e', long)]
         edit: bool,
+
+        /// Filter sessions by project directory when using -c or -i
+        #[arg(short = 'p', long)]
+        project: Option<String>,
     },
 
     /// Show top sessions by cost, tokens, or message count
@@ -325,6 +329,10 @@ enum Commands {
         /// Session ID
         #[arg(short, long)]
         session: Option<String>,
+
+        /// Filter sessions by project directory when using -c or interactive mode
+        #[arg(short = 'p', long)]
+        project: Option<String>,
     },
 
     /// Generate shell completion scripts
@@ -363,8 +371,8 @@ fn main() -> Result<()> {
         Commands::Diff { id } => {
             cmd_diff(&conn, &id)
         }
-        Commands::Run { message, session, fork, interactive, input, continue_flag, edit } => {
-            cmd_run(&conn, message.as_deref(), session.as_deref(), fork, interactive, input, continue_flag, edit)
+        Commands::Run { message, session, fork, interactive, input, continue_flag, edit, project } => {
+            cmd_run(&conn, message.as_deref(), session.as_deref(), fork, interactive, input, continue_flag, edit, project.as_deref())
         }
         Commands::Top { limit, by, json } => {
             cmd_top(&conn, limit, &by, json)
@@ -387,8 +395,8 @@ fn main() -> Result<()> {
         Commands::Tag { id, tag, remove, list, search } => {
             cmd_tag(&conn, id.as_deref(), tag.as_deref(), remove, list, search.as_deref())
         }
-        Commands::Undo { session, continue_flag } => {
-            cmd_undo(&conn, session.as_deref(), continue_flag)
+        Commands::Undo { session, continue_flag, project } => {
+            cmd_undo(&conn, session.as_deref(), continue_flag, project.as_deref())
         }
         Commands::Completion { shell } => {
             cmd_completion(&shell)
@@ -689,7 +697,7 @@ fn cmd_stats(conn: &rusqlite::Connection, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(conn: &rusqlite::Connection, message: Option<&str>, session: Option<&str>, fork: bool, interactive: bool, input: bool, cont: bool, edit: bool) -> Result<()> {
+fn cmd_run(conn: &rusqlite::Connection, message: Option<&str>, session: Option<&str>, fork: bool, interactive: bool, input: bool, cont: bool, edit: bool, project: Option<&str>) -> Result<()> {
     if which("opencode").is_err() {
         bail!("'opencode' binary not found in PATH.");
     }
@@ -700,7 +708,7 @@ fn cmd_run(conn: &rusqlite::Connection, message: Option<&str>, session: Option<&
             s.to_string()
         }
         None if interactive => {
-            let sessions = db::list_sessions(conn, 50, None, None, None, None, None, false, true)?;
+            let sessions = db::list_sessions(conn, 50, None, None, None, project, None, false, true)?;
             if sessions.is_empty() {
                 bail!("No sessions found.");
             }
@@ -1419,21 +1427,21 @@ fn cmd_completion(shell: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_undo(conn: &rusqlite::Connection, session: Option<&str>, cont: bool) -> Result<()> {
+fn cmd_undo(conn: &rusqlite::Connection, session: Option<&str>, cont: bool, project: Option<&str>) -> Result<()> {
     let sid = match session {
         Some(s) => {
             validate_session_id(s)?;
             s.to_string()
         }
         None if cont => {
-            let sessions = db::list_sessions(conn, 1, None, None, None, None, None, false, true)?;
+            let sessions = db::list_sessions(conn, 1, None, None, None, project, None, false, true)?;
             sessions.first()
                 .cloned()
                 .with_context(|| "No sessions found.")?
                 .id
         }
         None => {
-            let sessions = db::list_sessions(conn, 50, None, None, None, None, None, false, true)?;
+            let sessions = db::list_sessions(conn, 50, None, None, None, project, None, false, true)?;
             if sessions.is_empty() {
                 bail!("No sessions found.");
             }
