@@ -199,6 +199,17 @@ enum Commands {
         json: bool,
     },
 
+    /// Show an aggregate dashboard with overall stats, model breakdown, and project costs
+    Dashboard {
+        /// Maximum projects/sessions to show
+        #[arg(short, long, default_value = "10")]
+        limit: i64,
+
+        /// Output as JSON
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
     /// Compare two sessions side by side
     Compare {
         /// First session ID
@@ -369,6 +380,9 @@ fn main() -> Result<()> {
         }
         Commands::Top { limit, by, json } => {
             cmd::cmd_top(&conn, limit, &by, json)
+        }
+        Commands::Dashboard { limit, json } => {
+            cmd::cmd_dashboard(&conn, limit, json)
         }
         Commands::Compare { id1, id2, stats, json, output } => {
             cmd::cmd_compare(&conn, &id1, &id2, stats, json, output.as_deref())
