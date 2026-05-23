@@ -264,6 +264,31 @@ pub struct ProjectGroup {
     pub last_active: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectStats {
+    pub directory: String,
+    pub session_count: i64,
+    pub total_messages: i64,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+    pub last_active: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Dashboard {
+    pub total_sessions: i64,
+    pub total_messages: i64,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+    pub avg_tokens_per_session: f64,
+    pub avg_cost_per_session: f64,
+    pub period_start: String,
+    pub period_end: String,
+    pub model_breakdown: Vec<ModelBreakdown>,
+    pub project_stats: Vec<ProjectStats>,
+    pub top_sessions: Vec<TopSessionEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoTagRule {
     pub id: String,
