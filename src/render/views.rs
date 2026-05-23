@@ -753,6 +753,79 @@ fn cell_i64(out: &mut String, label: &str, v1: i64, v2: i64) {
     writeln!(out, "| {} | {} | {} |", label, v1, v2).ok();
 }
 
+/// Render an aggregate dashboard view
+pub fn render_dashboard(dash: &Dashboard) -> String {
+    let mut out = String::new();
+    out.push_str("# OpenCode Dashboard\n\n");
+
+    // Overview section
+    out.push_str("## Overview\n\n");
+    out.push_str("| Metric | Value |\n|---|---|\n");
+    out.push_str(&format!("| **Period** | {} — {} |\n", dash.period_start, dash.period_end));
+    out.push_str(&format!("| **Total Sessions** | {} |\n", dash.total_sessions));
+    out.push_str(&format!("| **Total Messages** | {} |\n", dash.total_messages));
+    out.push_str(&format!("| **Total Tokens** | {} |\n", dash.total_tokens));
+    out.push_str(&format!("| **Total Cost** | ${:.4} |\n", dash.total_cost));
+    out.push_str(&format!("| **Avg Tokens/Session** | {:.1} |\n", dash.avg_tokens_per_session));
+    out.push_str(&format!("| **Avg Cost/Session** | ${:.4} |\n", dash.avg_cost_per_session));
+    out.push('\n');
+
+    // Cost bar (visual indicator)
+    if dash.total_cost > 0.0 {
+        let bar_len = (dash.total_cost * 10.0).min(40.0) as usize;
+        let bar = "█".repeat(bar_len.max(1));
+        out.push_str(&format!("**Cost bar**: {} ${:.4}\n\n", bar, dash.total_cost));
+    }
+
+    // Model breakdown
+    if !dash.model_breakdown.is_empty() {
+        out.push_str("## Model Usage\n\n");
+        out.push_str("| Model | Messages | Tokens | Cost | Share |\n|---|---|---|---|---|\n");
+        let total_model_cost: f64 = dash.model_breakdown.iter().map(|m| m.total_cost).sum();
+        for m in &dash.model_breakdown {
+            let pct = if total_model_cost > 0.0 {
+                format!("{:.1}%", m.total_cost / total_model_cost * 100.0)
+            } else {
+                "—".to_string()
+            };
+            out.push_str(&format!("| {} | {} | {} | ${:.4} | {} |\n",
+                m.model, m.message_count, m.total_tokens, m.total_cost, pct));
+        }
+        out.push('\n');
+    }
+
+    // Project breakdown
+    if !dash.project_stats.is_empty() {
+        out.push_str("## Projects\n\n");
+        out.push_str("| # | Directory | Sessions | Messages | Tokens | Cost | Last Active |\n|---|---|---|---|---|---|---|\n");
+        for (i, p) in dash.project_stats.iter().enumerate() {
+            let ts = crate::render::ts_to_compact(p.last_active);
+            out.push_str(&format!("| {} | `{}` | {} | {} | {} | ${:.4} | {} |\n",
+                i + 1, p.directory, p.session_count, p.total_messages, p.total_tokens, p.total_cost, ts));
+        }
+        out.push('\n');
+    }
+
+    // Top sessions
+    if !dash.top_sessions.is_empty() {
+        out.push_str("## Top Sessions by Cost\n\n");
+        out.push_str("| # | Session | Messages | Tokens | Cost |\n|---|---|---|---|---|\n");
+        for (i, s) in dash.top_sessions.iter().enumerate() {
+            let short_id = if s.id.chars().count() > 16 {
+                format!("{}…", s.id.chars().take(16).collect::<String>())
+            } else {
+                s.id.clone()
+            };
+            let title_escaped = s.title.replace('|', "\\|");
+            out.push_str(&format!("| {} | `{}` {} | {} | {} | ${:.4} |\n",
+                i + 1, short_id, title_escaped, s.msg_count, s.total_tokens, s.total_cost));
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
 pub fn render_compare_json(
     s1: &Session,
     s2: &Session,
