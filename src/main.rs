@@ -105,6 +105,18 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         limit: i64,
 
+        /// Number of results to skip (for pagination)
+        #[arg(long)]
+        offset: Option<i64>,
+
+        /// Show results created after this date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Show results created before this date (YYYY-MM-DD)
+        #[arg(long)]
+        until: Option<String>,
+
         /// Output as JSON
         #[arg(short = 'j', long)]
         json: bool,
@@ -360,8 +372,10 @@ fn main() -> Result<()> {
         Commands::Stats { id, json } => {
             cmd::cmd_stats(&conn, &id, json)
         }
-        Commands::Search { query, limit, json } => {
-            cmd::cmd_search(&conn, &query, limit, json)
+        Commands::Search { query, limit, offset, since, until, json } => {
+            let since_ts = since.as_deref().and_then(cmd::parse_date);
+            let until_ts = until.as_deref().and_then(cmd::parse_date);
+            cmd::cmd_search(&conn, &query, limit, offset, since_ts, until_ts, json)
         }
         Commands::Projects { limit, json } => {
             cmd::cmd_projects(&conn, limit, json)

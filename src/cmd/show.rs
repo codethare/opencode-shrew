@@ -74,8 +74,16 @@ pub fn cmd_show(
     Ok(())
 }
 
-pub fn cmd_search(conn: &rusqlite::Connection, query: &str, limit: i64, json: bool) -> Result<()> {
-    let results = db::search_sessions(conn, query, limit)?;
+pub fn cmd_search(
+    conn: &rusqlite::Connection,
+    query: &str,
+    limit: i64,
+    offset: Option<i64>,
+    since: Option<i64>,
+    until: Option<i64>,
+    json: bool,
+) -> Result<()> {
+    let results = db::search_sessions(conn, query, limit, offset, since, until)?;
     if json {
         let output = serde_json::to_string_pretty(&results)?;
         println!("{output}");

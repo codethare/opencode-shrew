@@ -391,21 +391,51 @@ pub fn get_messages_with_parts_range(
 }
 
 /// Search session messages content for a query string
-pub fn search_sessions(conn: &Connection, query: &str, limit: i64) -> Result<Vec<SearchResult>> {
-    let sql = "\
-        SELECT s.id AS session_id, s.title, s.time_created, \
+pub fn search_sessions(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    offset: Option<i64>,
+    since_ts: Option<i64>,
+    until_ts: Option<i64>,
+) -> Result<Vec<SearchResult>> {
+    let mut sql = String::from(
+        "SELECT s.id AS session_id, s.title, s.time_created, \
                m.id AS message_id, m.time_created AS msg_time_created, \
                p.id AS part_id, p.data AS part_data \
-        FROM part p \
-        JOIN message m ON m.id = p.message_id \
-        JOIN session s ON s.id = m.session_id \
-        WHERE p.data LIKE ?1 ESCAPE '\\' AND json_extract(p.data, '$.type') IN ('text', 'reasoning') \
-        ORDER BY m.time_created DESC \
-        LIMIT ?2";
+         FROM part p \
+         JOIN message m ON m.id = p.message_id \
+         JOIN session s ON s.id = m.session_id \
+         WHERE p.data LIKE ? ESCAPE '\\' \
+           AND json_extract(p.data, '$.type') IN ('text', 'reasoning')"
+    );
 
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(rusqlite::params![pattern, limit], |row| {
+    params.push(Box::new(pattern));
+
+    if let Some(ts) = since_ts {
+        sql.push_str(" AND s.time_created >= ?");
+        params.push(Box::new(ts));
+    }
+    if let Some(ts) = until_ts {
+        sql.push_str(" AND s.time_created <= ?");
+        params.push(Box::new(ts));
+    }
+
+    sql.push_str(" ORDER BY m.time_created DESC LIMIT ?");
+    params.push(Box::new(limit));
+
+    if let Some(off) = offset {
+        if off > 0 {
+            sql.push_str(" OFFSET ?");
+            params.push(Box::new(off));
+        }
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
         let part_data_str: String = row.get("part_data")?;
         let part_data: PartData = serde_json::from_str(&part_data_str)
             .unwrap_or_else(|_| PartData {
