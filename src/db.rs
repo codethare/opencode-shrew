@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 use crate::models::*;
 
@@ -36,14 +36,20 @@ pub fn list_sessions(
     since: Option<i64>,
     until: Option<i64>,
     project: Option<&str>,
+    min_msgs: Option<i64>,
+    cli_only: bool,
+    show_all: bool,
 ) -> Result<Vec<Session>> {
     let mut sql = String::from(
         "SELECT s.id, s.project_id, s.slug, s.directory, s.title, \
                 s.time_created, s.time_updated, \
                 s.summary_additions, s.summary_deletions, s.summary_files, \
+                s.parent_id, \
                 (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msg_count, \
                 (SELECT json_extract(m.data, '$.model.modelID') FROM message m \
-                 WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model \
+                 WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model, \
+                COALESCE((SELECT SUM(json_extract(m.data, '$.cost')) FROM message m \
+                 WHERE m.session_id = s.id AND json_extract(m.data, '$.cost') IS NOT NULL), 0.0) AS total_cost \
          FROM session s"
     );
 
@@ -67,9 +73,33 @@ pub fn list_sessions(
         params.push(Box::new(ts));
     }
     if let Some(dir) = project {
+        let escaped = dir.replace('%', "\\%").replace('_', "\\_");
+        let like_pattern = format!("%/{}", escaped);
         param_idx += 1;
-        conditions.push(format!("s.directory LIKE ?{param_idx} ESCAPE '\\'"));
-        params.push(Box::new(format!("%{}%", dir.replace('%', "\\%").replace('_', "\\_"))));
+        let exact_idx = param_idx;
+        param_idx += 1;
+        let like_idx = param_idx;
+        conditions.push(format!(
+            "(s.directory = ?{exact_idx} OR s.directory LIKE ?{like_idx} ESCAPE '\\')"
+        ));
+        params.push(Box::new(dir.to_string()));
+        params.push(Box::new(like_pattern));
+    }
+
+    if let Some(min) = min_msgs {
+        param_idx += 1;
+        conditions.push(format!(
+            "(SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) >= ?{param_idx}"
+        ));
+        params.push(Box::new(min));
+    }
+
+    if !show_all {
+        conditions.push("s.parent_id IS NULL".to_string());
+    }
+
+    if cli_only {
+        conditions.push("s.permission IS NULL".to_string());
     }
 
     if !conditions.is_empty() {
@@ -101,6 +131,8 @@ pub fn list_sessions(
             summary_files: row.get("summary_files")?,
             msg_count: row.get("msg_count")?,
             model: row.get("model")?,
+            total_cost: row.get("total_cost")?,
+            parent_id: row.get("parent_id")?,
         })
     })?;
 
@@ -116,13 +148,6 @@ pub fn get_data_version(conn: &Connection) -> Result<i64> {
     Ok(val)
 }
 
-pub fn get_message_count(conn: &Connection, session_id: &str) -> Result<i64> {
-    let sql = "SELECT COUNT(*) FROM message WHERE session_id = ?1";
-    let mut stmt = conn.prepare(sql)?;
-    let count: i64 = stmt.query_row([session_id], |row| row.get(0))?;
-    Ok(count)
-}
-
 pub fn list_sessions_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Session>> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -136,7 +161,10 @@ pub fn list_sessions_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Ses
                 s.summary_additions, s.summary_deletions, s.summary_files, \
                 (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msg_count, \
                 (SELECT json_extract(m.data, '$.model.modelID') FROM message m \
-                 WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model \
+                 WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model, \
+                COALESCE((SELECT SUM(json_extract(m.data, '$.cost')) FROM message m \
+                 WHERE m.session_id = s.id AND json_extract(m.data, '$.cost') IS NOT NULL), 0.0) AS total_cost, \
+                 s.parent_id \
          FROM session s WHERE s.id IN ({}) \
          ORDER BY s.time_created DESC",
         placeholders.join(",")
@@ -160,6 +188,8 @@ pub fn list_sessions_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Ses
             summary_files: row.get("summary_files")?,
             msg_count: row.get("msg_count")?,
             model: row.get("model")?,
+            total_cost: row.get("total_cost")?,
+            parent_id: row.get("parent_id")?,
         })
     })?;
     let mut sessions = Vec::new();
@@ -173,9 +203,12 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
     let sql = "SELECT s.id, s.project_id, s.slug, s.directory, s.title, \
                s.time_created, s.time_updated, \
                s.summary_additions, s.summary_deletions, s.summary_files, \
+               s.parent_id, \
                (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msg_count, \
                (SELECT json_extract(m.data, '$.model.modelID') FROM message m \
-                WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model \
+                WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model, \
+               COALESCE((SELECT SUM(json_extract(m.data, '$.cost')) FROM message m \
+                WHERE m.session_id = s.id AND json_extract(m.data, '$.cost') IS NOT NULL), 0.0) AS total_cost \
          FROM session s WHERE s.id = ?1";
     let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query_map([id], |row| {
@@ -192,6 +225,8 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
             summary_files: row.get("summary_files")?,
             msg_count: row.get("msg_count")?,
             model: row.get("model")?,
+            total_cost: row.get("total_cost")?,
+            parent_id: row.get("parent_id")?,
         })
     })?;
     match rows.next() {
@@ -199,6 +234,7 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
         None => Ok(None),
     }
 }
+
 
 pub fn get_messages(conn: &Connection, session_id: &str) -> Result<Vec<Message>> {
     let sql = "SELECT id, session_id, time_created, data \
@@ -234,9 +270,9 @@ pub fn get_messages(conn: &Connection, session_id: &str) -> Result<Vec<Message>>
     Ok(messages)
 }
 
-pub fn get_parts_batch(conn: &Connection, message_ids: &[String]) -> Result<Vec<(String, Vec<Part>)>> {
+pub fn get_parts_batch(conn: &Connection, message_ids: &[String]) -> Result<std::collections::HashMap<String, Vec<Part>>> {
     if message_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(std::collections::HashMap::new());
     }
     let placeholders: Vec<String> = message_ids.iter().enumerate()
         .map(|(i, _)| format!("?{}", i + 1))
@@ -281,27 +317,125 @@ pub fn get_parts_batch(conn: &Connection, message_ids: &[String]) -> Result<Vec<
             vec.push(part);
         }
     }
-    Ok(message_ids.iter()
-        .filter_map(|id| parts_by_msg.remove(id).map(|parts| (id.clone(), parts)))
+    Ok(parts_by_msg)
+}
+
+
+pub fn get_message_count(conn: &Connection, session_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM message WHERE session_id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn get_messages_range(
+    conn: &Connection,
+    session_id: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<Message>> {
+    let sql = "SELECT id, session_id, time_created, data \
+               FROM message WHERE session_id = ?1 \
+               ORDER BY time_created ASC, id ASC \
+               LIMIT ?2 OFFSET ?3";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![session_id, limit, offset], |row| {
+        let data_str: String = row.get("data")?;
+        let data: MessageData = serde_json::from_str(&data_str).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to parse message data JSON: {e}");
+            MessageData {
+                role: "unknown".to_string(),
+                agent: None,
+                model: None,
+                tokens: None,
+                cost: None,
+                mode: None,
+                parent_id: None,
+            }
+        });
+        Ok(Message {
+            id: row.get("id")?,
+            session_id: row.get("session_id")?,
+            time_created: row.get("time_created")?,
+            data,
+        })
+    })?;
+    let mut messages = Vec::new();
+    for row in rows {
+        messages.push(row?);
+    }
+    Ok(messages)
+}
+
+pub fn get_messages_with_parts_range(
+    conn: &Connection,
+    session_id: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<MessageWithParts>> {
+    let messages = get_messages_range(conn, session_id, offset, limit)?;
+    let msg_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+    let mut parts_map = get_parts_batch(conn, &msg_ids)?;
+    Ok(messages
+        .into_iter()
+        .map(|msg| {
+            let msg_id = msg.id.clone();
+            MessageWithParts {
+                message: msg,
+                parts: parts_map.remove(&msg_id).unwrap_or_default(),
+            }
+        })
         .collect())
 }
 
 /// Search session messages content for a query string
-pub fn search_sessions(conn: &Connection, query: &str, limit: i64) -> Result<Vec<SearchResult>> {
-    let sql = "\
-        SELECT s.id AS session_id, s.title, s.time_created, \
+pub fn search_sessions(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    offset: Option<i64>,
+    since_ts: Option<i64>,
+    until_ts: Option<i64>,
+) -> Result<Vec<SearchResult>> {
+    let mut sql = String::from(
+        "SELECT s.id AS session_id, s.title, s.time_created, \
                m.id AS message_id, m.time_created AS msg_time_created, \
                p.id AS part_id, p.data AS part_data \
-        FROM part p \
-        JOIN message m ON m.id = p.message_id \
-        JOIN session s ON s.id = m.session_id \
-        WHERE p.data LIKE ?1 ESCAPE '\\' AND json_extract(p.data, '$.type') IN ('text', 'reasoning') \
-        ORDER BY m.time_created DESC \
-        LIMIT ?2";
+         FROM part p \
+         JOIN message m ON m.id = p.message_id \
+         JOIN session s ON s.id = m.session_id \
+         WHERE p.data LIKE ? ESCAPE '\\' \
+           AND json_extract(p.data, '$.type') IN ('text', 'reasoning')"
+    );
 
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(rusqlite::params![pattern, limit], |row| {
+    params.push(Box::new(pattern));
+
+    if let Some(ts) = since_ts {
+        sql.push_str(" AND s.time_created >= ?");
+        params.push(Box::new(ts));
+    }
+    if let Some(ts) = until_ts {
+        sql.push_str(" AND s.time_created <= ?");
+        params.push(Box::new(ts));
+    }
+
+    sql.push_str(" ORDER BY m.time_created DESC LIMIT ?");
+    params.push(Box::new(limit));
+
+    if let Some(off) = offset {
+        if off > 0 {
+            sql.push_str(" OFFSET ?");
+            params.push(Box::new(off));
+        }
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
         let part_data_str: String = row.get("part_data")?;
         let part_data: PartData = serde_json::from_str(&part_data_str)
             .unwrap_or_else(|_| PartData {
@@ -462,6 +596,65 @@ pub fn delete_session(conn: &Connection, id: &str) -> Result<bool> {
     Ok(affected > 0)
 }
 
+pub fn delete_message(conn: &Connection, message_id: &str) -> Result<bool> {
+    conn.execute("DELETE FROM part WHERE message_id = ?1", params![message_id])?;
+    let affected = conn.execute("DELETE FROM message WHERE id = ?1", params![message_id])?;
+    Ok(affected > 0)
+}
+
+pub fn get_message_text(conn: &Connection, message_id: &str) -> Result<String> {
+    let sql = "SELECT data FROM part WHERE message_id = ?1 ORDER BY id ASC";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![message_id], |row| {
+        let data_str: String = row.get(0)?;
+        Ok(data_str)
+    })?;
+    let mut text = String::new();
+    for row in rows {
+        let data_str = row?;
+        if let Ok(part_data) = serde_json::from_str::<PartData>(&data_str) {
+            match part_data.r#type.as_str() {
+                "text" | "reasoning" => {
+                    if let Some(t) = &part_data.text {
+                        text.push_str(t);
+                        text.push('\n');
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(text.trim().to_string())
+}
+
+pub fn update_message_text(conn: &Connection, message_id: &str, new_text: &str) -> Result<()> {
+    let sql = "SELECT id, data FROM part WHERE message_id = ?1 \
+               AND json_extract(data, '$.type') IN ('text', 'reasoning') \
+               ORDER BY id ASC LIMIT 1";
+    let mut stmt = conn.prepare(sql)?;
+    let result: std::result::Result<(String, String), rusqlite::Error> =
+        stmt.query_row(params![message_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        });
+
+    if let Ok((part_id, data_str)) = result {
+        let mut part_data: PartData = serde_json::from_str(&data_str)?;
+        part_data.text = Some(new_text.to_string());
+        let updated = serde_json::to_string(&part_data)?;
+        conn.execute(
+            "UPDATE part SET data = ?1 WHERE id = ?2",
+            params![updated, part_id],
+        )?;
+
+        conn.execute(
+            "DELETE FROM part WHERE message_id = ?1 AND id != ?2 \
+             AND json_extract(data, '$.type') IN ('text', 'reasoning')",
+            params![message_id, part_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// Read session diff from storage
 pub fn read_session_diff(session_id: &str) -> Result<Vec<DiffEntry>> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/oc".to_string());
@@ -488,13 +681,16 @@ pub fn list_old_sessions(conn: &Connection, days: i64, limit: i64) -> Result<Vec
         SELECT s.id, s.project_id, s.slug, s.directory, s.title, \
                s.time_created, s.time_updated, \
                s.summary_additions, s.summary_deletions, s.summary_files, \
+               s.parent_id, \
                (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS msg_count, \
                (SELECT json_extract(m.data, '$.model.modelID') FROM message m \
-                WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model \
-        FROM session s \
-        WHERE s.time_created < ?1 \
-        ORDER BY s.time_created ASC \
-        LIMIT ?2";
+                WHERE m.session_id = s.id AND m.data LIKE '%model%' LIMIT 1) AS model, \
+               COALESCE((SELECT SUM(json_extract(m.data, '$.cost')) FROM message m \
+                WHERE m.session_id = s.id AND json_extract(m.data, '$.cost') IS NOT NULL), 0.0) AS total_cost \
+         FROM session s \
+         WHERE s.time_created < ?1 \
+         ORDER BY s.time_created ASC \
+         LIMIT ?2";
 
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(rusqlite::params![cutoff_ms, limit], |row| {
@@ -511,6 +707,8 @@ pub fn list_old_sessions(conn: &Connection, days: i64, limit: i64) -> Result<Vec
             summary_files: row.get("summary_files")?,
             msg_count: row.get("msg_count")?,
             model: row.get("model")?,
+            total_cost: row.get("total_cost")?,
+            parent_id: row.get("parent_id")?,
         })
     })?;
     let mut sessions = Vec::new();
@@ -547,14 +745,17 @@ pub fn get_session_stats(conn: &Connection, session_id: &str) -> Result<SessionS
 
     for row in rows {
         let data_str = row?;
-        let data: MessageData = serde_json::from_str(&data_str).unwrap_or_else(|_| MessageData {
-            role: "unknown".to_string(),
-            agent: None,
-            model: None,
-            tokens: None,
-            cost: None,
-            mode: None,
-            parent_id: None,
+        let data: MessageData = serde_json::from_str(&data_str).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to parse message.data JSON in get_stats: {e}");
+            MessageData {
+                role: "unknown".to_string(),
+                agent: None,
+                model: None,
+                tokens: None,
+                cost: None,
+                mode: None,
+                parent_id: None,
+            }
         });
         total_messages += 1;
         match data.role.as_str() {
@@ -715,6 +916,105 @@ pub fn top_sessions_in_range(conn: &Connection, limit: i64, since_ts: i64, until
     Ok(entries)
 }
 
+/// Get per-project stats with token and cost aggregates
+pub fn get_project_stats(conn: &Connection, limit: i64) -> Result<Vec<ProjectStats>> {
+    let sql = "\
+        SELECT s.directory, \
+               COUNT(DISTINCT s.id) AS session_count, \
+               COALESCE(SUM((SELECT COUNT(*) FROM message m WHERE m.session_id = s.id)), 0) AS total_messages, \
+               COALESCE(SUM(CAST(json_extract(m2.data, '$.tokens.total') AS INTEGER)), 0) AS total_tokens, \
+               COALESCE(SUM(CAST(json_extract(m2.data, '$.cost') AS REAL)), 0.0) AS total_cost, \
+               MAX(s.time_created) AS last_active \
+        FROM session s \
+        LEFT JOIN message m2 ON m2.session_id = s.id \
+        GROUP BY s.directory \
+        ORDER BY total_cost DESC \
+        LIMIT ?1";
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([limit], |row| {
+        Ok(ProjectStats {
+            directory: row.get("directory")?,
+            session_count: row.get("session_count")?,
+            total_messages: row.get("total_messages")?,
+            total_tokens: row.get("total_tokens")?,
+            total_cost: row.get("total_cost")?,
+            last_active: row.get("last_active")?,
+        })
+    })?;
+    let mut stats = Vec::new();
+    for row in rows {
+        stats.push(row?);
+    }
+    Ok(stats)
+}
+
+/// Get aggregated dashboard stats across all sessions
+pub fn get_dashboard(conn: &Connection, limit: i64) -> Result<Dashboard> {
+    // Overall totals
+    let overall_sql = "\
+        SELECT \
+            COUNT(DISTINCT s.id) AS total_sessions, \
+            COALESCE(COUNT(m.id), 0) AS total_messages, \
+            COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER)), 0) AS total_tokens, \
+            COALESCE(SUM(CAST(json_extract(m.data, '$.cost') AS REAL)), 0.0) AS total_cost, \
+            COALESCE(MIN(s.time_created), 0) AS period_start_ts, \
+            COALESCE(MAX(s.time_created), 0) AS period_end_ts \
+        FROM session s \
+        LEFT JOIN message m ON m.session_id = s.id";
+
+    let mut stmt = conn.prepare(overall_sql)?;
+    let (total_sessions, total_messages, total_tokens, total_cost, period_start_ts, period_end_ts) =
+        stmt.query_row([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+    let avg_tokens_per_session = if total_sessions > 0 {
+        total_tokens as f64 / total_sessions as f64
+    } else {
+        0.0
+    };
+    let avg_cost_per_session = if total_sessions > 0 {
+        total_cost / total_sessions as f64
+    } else {
+        0.0
+    };
+
+    // Format period timestamps
+    let fmt_ts = |ts: i64| -> String {
+        let secs = ts / 1000;
+        let nsecs = (ts.rem_euclid(1000) * 1_000_000) as u32;
+        chrono::DateTime::from_timestamp(secs, nsecs)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_default()
+    };
+
+    let model_breakdown = get_model_breakdown(conn, 0, i64::MAX)?;
+    let project_stats = get_project_stats(conn, limit)?;
+    let top_sessions = top_sessions(conn, limit, "cost")?;
+
+    Ok(Dashboard {
+        total_sessions,
+        total_messages,
+        total_tokens,
+        total_cost,
+        avg_tokens_per_session,
+        avg_cost_per_session,
+        period_start: fmt_ts(period_start_ts),
+        period_end: fmt_ts(period_end_ts),
+        model_breakdown,
+        project_stats,
+        top_sessions,
+    })
+}
+
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -753,3 +1053,5 @@ fn truncate_with_context(text: &str, query: &str, context_chars: usize) -> Strin
         }
     }
 }
+
+

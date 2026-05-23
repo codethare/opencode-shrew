@@ -1,7 +1,7 @@
-use chrono::DateTime;
+use std::fmt::Write;
 
 use crate::models::*;
-use std::fmt::Write;
+use super::{ts_to_compact, ts_to_iso, ts_to_iso_short, ts_to_time};
 
 /// Render list of sessions as markdown
 pub fn render_session_list(sessions: &[Session]) -> String {
@@ -29,13 +29,27 @@ pub fn render_session_list_compact(sessions: &[Session]) -> Vec<String> {
         .map(|s| {
             let created_ts = ts_to_compact(s.time_created);
             let model = s.model.as_deref().unwrap_or("unknown");
-            format!("{}\t{}\t{}\t{}\t{}", s.id, created_ts, s.msg_count, model, s.title)
+            let project = s.directory.rsplit('/').next().unwrap_or(&s.directory);
+            let cost_str = if s.total_cost > 0.0 {
+                format!("${:.2}", s.total_cost)
+            } else {
+                String::new()
+            };
+            format!("{}\t{}\t{}\t{}\t{}\t{}\t{}", s.id, created_ts, s.msg_count, model, cost_str, project, s.title)
         })
         .collect()
 }
 
 /// Render a full session with its messages as markdown
 pub fn render_session_detail(session: &Session, messages: &[MessageWithParts], show_tools: bool) -> String {
+    let mut out = render_session_header(session);
+    for msg_with_parts in messages {
+        render_message(&mut out, msg_with_parts, show_tools);
+    }
+    out
+}
+
+pub fn render_session_header(session: &Session) -> String {
     let mut out = String::new();
     let model = session.model.as_deref().unwrap_or("unknown");
     let created_ts = ts_to_iso_short(session.time_created);
@@ -58,9 +72,13 @@ pub fn render_session_detail(session: &Session, messages: &[MessageWithParts], s
         }
     }
     out.push_str("\n---\n\n");
+    out
+}
 
-    for msg_with_parts in messages {
-        render_message(&mut out, msg_with_parts, show_tools);
+pub fn render_message_batch(messages: &[MessageWithParts], show_tools: bool) -> String {
+    let mut out = String::new();
+    for msg in messages {
+        render_message(&mut out, msg, show_tools);
     }
     out
 }
@@ -372,7 +390,6 @@ pub fn render_search_results(results: &[SearchResult], query: &str) -> String {
     out
 }
 
-/// Render top sessions table
 pub fn render_top_sessions(entries: &[TopSessionEntry], sort_by: &str) -> String {
     let mut out = String::new();
     let title = match sort_by {
@@ -405,7 +422,6 @@ pub fn render_top_sessions(entries: &[TopSessionEntry], sort_by: &str) -> String
     out
 }
 
-/// Render session as markdown with YAML frontmatter for export
 pub fn render_export_markdown(session: &Session, messages: &[MessageWithParts], show_tools: bool) -> String {
     let model = session.model.as_deref().unwrap_or("unknown");
     let created_ts = ts_to_iso(session.time_created);
@@ -613,7 +629,7 @@ pub fn render_message_compact(msg: &MessageWithParts) -> String {
         "user" => {
             let body = msg.text_body();
             let preview: String = body.chars().take(80).collect();
-            if body.len() > 80 {
+            if body.chars().count() > 80 {
                 format!("[{ts}] 🧑 User: {}…", preview)
             } else {
                 format!("[{ts}] 🧑 User: {}", preview)
@@ -630,7 +646,7 @@ pub fn render_message_compact(msg: &MessageWithParts) -> String {
                 .unwrap_or_default();
             let body = msg.text_body();
             let preview: String = body.chars().take(80).collect();
-            if body.len() > 80 {
+            if body.chars().count() > 80 {
                 format!("[{ts}] 🤖 {agent}{}{}: {}…", tokens, cost, preview)
             } else {
                 format!("[{ts}] 🤖 {agent}{}{}: {}", tokens, cost, preview)
@@ -640,21 +656,11 @@ pub fn render_message_compact(msg: &MessageWithParts) -> String {
     }
 }
 
-fn ts_to_iso(ts: i64) -> String {
-    let secs = ts / 1000;
-    let nsecs = ((ts % 1000) * 1_000_000) as u32;
-    match DateTime::from_timestamp(secs, nsecs) {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-        None => format!("(invalid timestamp {})", ts),
-    }
-}
-
 pub fn render_compare_markdown(
     s1: &Session,
     s2: &Session,
     mp1: &[MessageWithParts],
     mp2: &[MessageWithParts],
-    _stats_only: bool,
 ) -> Result<String, anyhow::Error> {
     let mut out = String::new();
     out.push_str("# 会话对比\n\n");
@@ -747,12 +753,84 @@ fn cell_i64(out: &mut String, label: &str, v1: i64, v2: i64) {
     writeln!(out, "| {} | {} | {} |", label, v1, v2).ok();
 }
 
+/// Render an aggregate dashboard view
+pub fn render_dashboard(dash: &Dashboard) -> String {
+    let mut out = String::new();
+    out.push_str("# OpenCode Dashboard\n\n");
+
+    // Overview section
+    out.push_str("## Overview\n\n");
+    out.push_str("| Metric | Value |\n|---|---|\n");
+    out.push_str(&format!("| **Period** | {} — {} |\n", dash.period_start, dash.period_end));
+    out.push_str(&format!("| **Total Sessions** | {} |\n", dash.total_sessions));
+    out.push_str(&format!("| **Total Messages** | {} |\n", dash.total_messages));
+    out.push_str(&format!("| **Total Tokens** | {} |\n", dash.total_tokens));
+    out.push_str(&format!("| **Total Cost** | ${:.4} |\n", dash.total_cost));
+    out.push_str(&format!("| **Avg Tokens/Session** | {:.1} |\n", dash.avg_tokens_per_session));
+    out.push_str(&format!("| **Avg Cost/Session** | ${:.4} |\n", dash.avg_cost_per_session));
+    out.push('\n');
+
+    // Cost bar (visual indicator)
+    if dash.total_cost > 0.0 {
+        let bar_len = (dash.total_cost * 10.0).min(40.0) as usize;
+        let bar = "█".repeat(bar_len.max(1));
+        out.push_str(&format!("**Cost bar**: {} ${:.4}\n\n", bar, dash.total_cost));
+    }
+
+    // Model breakdown
+    if !dash.model_breakdown.is_empty() {
+        out.push_str("## Model Usage\n\n");
+        out.push_str("| Model | Messages | Tokens | Cost | Share |\n|---|---|---|---|---|\n");
+        let total_model_cost: f64 = dash.model_breakdown.iter().map(|m| m.total_cost).sum();
+        for m in &dash.model_breakdown {
+            let pct = if total_model_cost > 0.0 {
+                format!("{:.1}%", m.total_cost / total_model_cost * 100.0)
+            } else {
+                "—".to_string()
+            };
+            out.push_str(&format!("| {} | {} | {} | ${:.4} | {} |\n",
+                m.model, m.message_count, m.total_tokens, m.total_cost, pct));
+        }
+        out.push('\n');
+    }
+
+    // Project breakdown
+    if !dash.project_stats.is_empty() {
+        out.push_str("## Projects\n\n");
+        out.push_str("| # | Directory | Sessions | Messages | Tokens | Cost | Last Active |\n|---|---|---|---|---|---|---|\n");
+        for (i, p) in dash.project_stats.iter().enumerate() {
+            let ts = crate::render::ts_to_compact(p.last_active);
+            out.push_str(&format!("| {} | `{}` | {} | {} | {} | ${:.4} | {} |\n",
+                i + 1, p.directory, p.session_count, p.total_messages, p.total_tokens, p.total_cost, ts));
+        }
+        out.push('\n');
+    }
+
+    // Top sessions
+    if !dash.top_sessions.is_empty() {
+        out.push_str("## Top Sessions by Cost\n\n");
+        out.push_str("| # | Session | Messages | Tokens | Cost |\n|---|---|---|---|---|\n");
+        for (i, s) in dash.top_sessions.iter().enumerate() {
+            let short_id = if s.id.chars().count() > 16 {
+                format!("{}…", s.id.chars().take(16).collect::<String>())
+            } else {
+                s.id.clone()
+            };
+            let title_escaped = s.title.replace('|', "\\|");
+            out.push_str(&format!("| {} | `{}` {} | {} | {} | ${:.4} |\n",
+                i + 1, short_id, title_escaped, s.msg_count, s.total_tokens, s.total_cost));
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
 pub fn render_compare_json(
     s1: &Session,
     s2: &Session,
     mp1: &[MessageWithParts],
     mp2: &[MessageWithParts],
-    _stats_only: bool,
 ) -> Result<String, anyhow::Error> {
     use serde::Serialize;
 
@@ -806,31 +884,4 @@ pub fn render_compare_json(
     };
 
     Ok(serde_json::to_string_pretty(&output)?)
-}
-
-fn ts_to_iso_short(ts: i64) -> String {
-    let secs = ts / 1000;
-    let nsecs = ((ts % 1000) * 1_000_000) as u32;
-    match DateTime::from_timestamp(secs, nsecs) {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-        None => format!("(invalid timestamp {})", ts),
-    }
-}
-
-fn ts_to_compact(ts: i64) -> String {
-    let secs = ts / 1000;
-    let nsecs = ((ts % 1000) * 1_000_000) as u32;
-    match DateTime::from_timestamp(secs, nsecs) {
-        Some(dt) => dt.format("%m-%d %H:%M").to_string(),
-        None => String::new(),
-    }
-}
-
-fn ts_to_time(ts: i64) -> String {
-    let secs = ts / 1000;
-    let nsecs = ((ts % 1000) * 1_000_000) as u32;
-    match DateTime::from_timestamp(secs, nsecs) {
-        Some(dt) => dt.format("%H:%M:%S").to_string(),
-        None => String::new(),
-    }
 }

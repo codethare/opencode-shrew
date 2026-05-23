@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+
+use crate::models::AutoTagRule;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OcsMeta {
@@ -9,6 +13,8 @@ pub struct OcsMeta {
     pub tags: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub notes: HashMap<String, String>,
+    #[serde(default)]
+    pub autotag_rules: Vec<AutoTagRule>,
 }
 
 
@@ -26,6 +32,7 @@ pub fn load_meta() -> Result<OcsMeta> {
         return Ok(OcsMeta {
             tags: HashMap::new(),
             notes: HashMap::new(),
+            autotag_rules: Vec::new(),
         });
     }
     let content = std::fs::read_to_string(&path)
@@ -42,10 +49,18 @@ pub fn save_meta(meta: &OcsMeta) -> Result<()> {
             .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
     }
     let content = serde_json::to_string_pretty(meta)?;
-    // Atomic write: temp file + rename to prevent corruption on crash
+    // Atomic write via O_EXCL temp + rename — prevents symlink races (TOCTOU)
     let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &content)
-        .with_context(|| format!("Failed to write meta file: {}", tmp_path.display()))?;
+    let _ = std::fs::remove_file(&tmp_path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&tmp_path)
+        .with_context(|| format!("Failed to create meta temp file: {}", tmp_path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write meta temp file: {}", tmp_path.display()))?;
+    file.flush()?;
     std::fs::rename(&tmp_path, &path)
         .with_context(|| format!("Failed to rename meta file: {}", path.display()))?;
     Ok(())
@@ -126,6 +141,8 @@ pub fn list_annotated_ids() -> Result<Vec<String>> {
     ids.sort();
     Ok(ids)
 }
+
+
 
 pub fn all_tags() -> Result<Vec<(String, usize)>> {
     let meta = load_meta()?;
