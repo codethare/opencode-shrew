@@ -886,6 +886,105 @@ pub fn top_sessions_in_range(conn: &Connection, limit: i64, since_ts: i64, until
     Ok(entries)
 }
 
+/// Get per-project stats with token and cost aggregates
+pub fn get_project_stats(conn: &Connection, limit: i64) -> Result<Vec<ProjectStats>> {
+    let sql = "\
+        SELECT s.directory, \
+               COUNT(DISTINCT s.id) AS session_count, \
+               COALESCE(SUM((SELECT COUNT(*) FROM message m WHERE m.session_id = s.id)), 0) AS total_messages, \
+               COALESCE(SUM(CAST(json_extract(m2.data, '$.tokens.total') AS INTEGER)), 0) AS total_tokens, \
+               COALESCE(SUM(CAST(json_extract(m2.data, '$.cost') AS REAL)), 0.0) AS total_cost, \
+               MAX(s.time_created) AS last_active \
+        FROM session s \
+        LEFT JOIN message m2 ON m2.session_id = s.id \
+        GROUP BY s.directory \
+        ORDER BY total_cost DESC \
+        LIMIT ?1";
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([limit], |row| {
+        Ok(ProjectStats {
+            directory: row.get("directory")?,
+            session_count: row.get("session_count")?,
+            total_messages: row.get("total_messages")?,
+            total_tokens: row.get("total_tokens")?,
+            total_cost: row.get("total_cost")?,
+            last_active: row.get("last_active")?,
+        })
+    })?;
+    let mut stats = Vec::new();
+    for row in rows {
+        stats.push(row?);
+    }
+    Ok(stats)
+}
+
+/// Get aggregated dashboard stats across all sessions
+pub fn get_dashboard(conn: &Connection, limit: i64) -> Result<Dashboard> {
+    // Overall totals
+    let overall_sql = "\
+        SELECT \
+            COUNT(DISTINCT s.id) AS total_sessions, \
+            COALESCE(COUNT(m.id), 0) AS total_messages, \
+            COALESCE(SUM(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER)), 0) AS total_tokens, \
+            COALESCE(SUM(CAST(json_extract(m.data, '$.cost') AS REAL)), 0.0) AS total_cost, \
+            COALESCE(MIN(s.time_created), 0) AS period_start_ts, \
+            COALESCE(MAX(s.time_created), 0) AS period_end_ts \
+        FROM session s \
+        LEFT JOIN message m ON m.session_id = s.id";
+
+    let mut stmt = conn.prepare(overall_sql)?;
+    let (total_sessions, total_messages, total_tokens, total_cost, period_start_ts, period_end_ts) =
+        stmt.query_row([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+    let avg_tokens_per_session = if total_sessions > 0 {
+        total_tokens as f64 / total_sessions as f64
+    } else {
+        0.0
+    };
+    let avg_cost_per_session = if total_sessions > 0 {
+        total_cost / total_sessions as f64
+    } else {
+        0.0
+    };
+
+    // Format period timestamps
+    let fmt_ts = |ts: i64| -> String {
+        let secs = ts / 1000;
+        let nsecs = (ts.rem_euclid(1000) * 1_000_000) as u32;
+        chrono::DateTime::from_timestamp(secs, nsecs)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_default()
+    };
+
+    let model_breakdown = get_model_breakdown(conn, 0, i64::MAX)?;
+    let project_stats = get_project_stats(conn, limit)?;
+    let top_sessions = top_sessions(conn, limit, "cost")?;
+
+    Ok(Dashboard {
+        total_sessions,
+        total_messages,
+        total_tokens,
+        total_cost,
+        avg_tokens_per_session,
+        avg_cost_per_session,
+        period_start: fmt_ts(period_start_ts),
+        period_end: fmt_ts(period_end_ts),
+        model_breakdown,
+        project_stats,
+        top_sessions,
+    })
+}
+
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
