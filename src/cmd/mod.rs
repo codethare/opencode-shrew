@@ -9,7 +9,7 @@ pub use list::cmd_list;
 pub use show::{cmd_show, cmd_search, cmd_diff};
 pub use run::{cmd_run, cmd_watch};
 pub use manage::{cmd_rename, cmd_prune, cmd_tag, cmd_annotate, cmd_undo, cmd_export};
-pub use analytics::{cmd_stats, cmd_top, cmd_projects, cmd_report, cmd_compare};
+pub use analytics::{cmd_stats, cmd_top, cmd_projects, cmd_report, cmd_compare, cmd_dashboard};
 pub use completion::cmd_completion;
 
 use anyhow::{bail, Context, Result};

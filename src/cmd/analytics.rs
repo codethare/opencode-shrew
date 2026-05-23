@@ -107,6 +107,18 @@ pub fn cmd_report(
     Ok(())
 }
 
+pub fn cmd_dashboard(conn: &rusqlite::Connection, limit: i64, json: bool) -> Result<()> {
+    let dash = db::get_dashboard(conn, limit)?;
+    if json {
+        let output = serde_json::to_string_pretty(&dash)?;
+        println!("{output}");
+    } else {
+        let output = render::render_dashboard(&dash);
+        println!("{output}");
+    }
+    Ok(())
+}
+
 pub fn cmd_compare(
     conn: &rusqlite::Connection,
     id1: &str,
